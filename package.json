@@ -1,0 +1,31 @@
+{
+  "name": "zopper-service-triage",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c orange,cyan \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": "node --watch server/dev.js",
+    "dev:web": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "node --test server/test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.118.0",
+    "dotenv": "^18.0.8",
+    "googleapis": "^187.0.0",
+    "lucide-react": "^1.61.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-router-dom": "^7.18.4"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.1.2",
+    "concurrently": "^10.0.6",
+    "vite": "^8.3.5"
+  }
+}
