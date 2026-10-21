@@ -509,6 +509,11 @@ button {
   font-size: 13px;
 }
 
+.link-btn--inline {
+  margin: 0;
+  font-size: inherit;
+}
+
 .link-btn--danger {
   margin-top: 0;
   justify-content: center;

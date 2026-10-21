@@ -7,7 +7,6 @@ process.env.SUPABASE_URL = 'http://fake-supabase.test';
 process.env.SUPABASE_SERVICE_ROLE_KEY = 'service-role';
 process.env.WEBFLOW_API_TOKEN = 'wf-token';
 process.env.WEBFLOW_SITE_ID = 'site1';
-delete process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 
 const { runIngest } = await import('../lib/ingest.js');
 

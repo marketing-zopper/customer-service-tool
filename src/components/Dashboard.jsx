@@ -156,7 +156,7 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
           <div className="topbar-user">
             {isAdmin ? (
               <>
-                <button className="btn btn--ghost btn--sm" onClick={sync} disabled={syncing} title="Pull new emails from the mailbox">
+                <button className="btn btn--ghost btn--sm" onClick={sync} disabled={syncing} title="Pull new website form submissions">
                   <RefreshCw size={15} className={syncing ? 'spin' : ''} aria-hidden="true" /> <span className="hide-sm">Sync</span>
                 </button>
                 <span className="user-chip hide-sm">{session.name}</span>

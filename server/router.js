@@ -248,7 +248,12 @@ const routes = [
 export async function handle(req, res) {
   try {
     const url = new URL(req.url, 'http://localhost');
-    const path = url.pathname.replace(/\/+$/, '') || '/';
+    // On Vercel every /api/... request is rewritten to the single function with the real path in
+    // `__path` (a nested file route like api/[...x].js only matches one segment there). Locally the
+    // URL already is the real path.
+    const forwarded = url.searchParams.get('__path');
+    url.searchParams.delete('__path');
+    const path = (forwarded !== null ? `/api/${forwarded}` : url.pathname).replace(/\/+$/, '') || '/';
 
     const pathMatches = routes.filter(([, pattern]) => pattern.test(path));
     if (pathMatches.length === 0) throw new HttpError(404, 'Not found');

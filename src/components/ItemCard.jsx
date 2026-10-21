@@ -19,17 +19,20 @@ export default function ItemCard({ item, statuses, canEscalate, onStatusChange, 
   const [body, setBody] = useState(null);
   const [bodyError, setBodyError] = useState('');
 
-  async function toggle() {
+  async function loadBody() {
+    setBodyError('');
+    try {
+      const { item: full } = await api.getItem(item.id);
+      setBody(full.body_full || item.body_snippet || '(empty message)');
+    } catch (error) {
+      setBodyError(error.message);
+    }
+  }
+
+  function toggle() {
     const next = !open;
     setOpen(next);
-    if (next && body === null) {
-      try {
-        const { item: full } = await api.getItem(item.id);
-        setBody(full.body_full || item.body_snippet || '(empty message)');
-      } catch (error) {
-        setBodyError(error.message);
-      }
-    }
+    if (next && body === null) loadBody();
   }
 
   return (
@@ -64,7 +67,18 @@ export default function ItemCard({ item, statuses, canEscalate, onStatusChange, 
 
         {open && (
           <div className="card-body">
-            {bodyError ? <p className="form-error">{bodyError}</p> : body === null ? <p className="muted">Loading…</p> : body}
+            {body !== null ? (
+              body
+            ) : bodyError ? (
+              <p className="form-error">
+                {bodyError}{' '}
+                <button className="link-btn link-btn--inline" onClick={loadBody}>
+                  Try again
+                </button>
+              </p>
+            ) : (
+              <p className="muted">Loading…</p>
+            )}
           </div>
         )}
 

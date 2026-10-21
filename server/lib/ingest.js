@@ -1,6 +1,5 @@
 import { db, unwrap } from './supabase.js';
 import { envInt } from './config.js';
-import { fetchMessage, gmailConfigured, listRecentMessageIds, mailbox } from './gmail.js';
 import { fetchSubmissions, webflowConfigured } from './webflow.js';
 import { classifyEmail } from './classify.js';
 
@@ -26,7 +25,7 @@ async function filterUnseen(sourceIds) {
 
 /** Classifies one normalised item and stores it (and the fact that we've seen it). */
 async function record(source, item) {
-  const result = item.skip ? { outcome: 'ignore', snippet: item.snippet } : classifyEmail(item);
+  const result = classifyEmail(item);
 
   if (result.outcome !== 'ignore') {
     const isLead = result.outcome === 'lead';
@@ -82,30 +81,6 @@ async function runPool(source, ids, summary, load) {
   });
 }
 
-async function ingestGmail() {
-  const unseen = await filterUnseen(await listRecentMessageIds(envInt('INGEST_LOOKBACK_DAYS', 3)));
-  const batch = unseen.slice(0, envInt('INGEST_MAX_PER_RUN', 20));
-  const summary = newSummary(unseen.length, batch.length);
-
-  await runPool('gmail', batch, summary, async (id) => {
-    const message = await fetchMessage(id);
-    return {
-      sourceId: message.gmailMessageId,
-      sourceThreadId: message.gmailThreadId,
-      subject: message.subject,
-      fromEmail: message.fromEmail,
-      fromName: message.fromName,
-      headers: message.headers,
-      body: message.body,
-      snippet: message.snippet,
-      receivedAt: message.receivedAt,
-      // Our own outgoing mail is not something to triage.
-      skip: message.fromEmail === mailbox().toLowerCase(),
-    };
-  });
-  return summary;
-}
-
 async function ingestWebflow() {
   const items = await fetchSubmissions(envInt('WEBFLOW_LOOKBACK_DAYS', 90));
   const bySourceId = new Map(items.map((item) => [item.sourceId, item]));
@@ -116,13 +91,11 @@ async function ingestWebflow() {
   return summary;
 }
 
-/** Pulls new mail and website-form submissions, classifies them and stores them. Safe to re-run. */
+/** Pulls new website-form submissions, classifies them and stores them. Safe to re-run. */
 export async function runIngest() {
   const sources = {};
-  const jobs = [
-    ['gmail', gmailConfigured, ingestGmail],
-    ['webflow', webflowConfigured, ingestWebflow],
-  ];
+  // One source today (Webflow forms); keep the list shape so another can be added.
+  const jobs = [['webflow', webflowConfigured, ingestWebflow]];
 
   for (const [name, configured, run] of jobs) {
     if (!configured()) {

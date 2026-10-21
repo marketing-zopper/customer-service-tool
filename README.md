@@ -1,11 +1,11 @@
 # Zopper Service Triage
 
-Internal dashboard that pulls emails from `marketingext@zopper.com`, sorts them into **Partnership** or **Complaints / Enquiries**, and lets the marketing team escalate any item to the concerned person through a one-item magic link. There are no user accounts. Access is either the shared marketing password or a magic link.
+Internal dashboard that pulls the website's contact-form submissions from Webflow (read-only), sorts them into **Partnership** or **Complaints / Enquiries**, and lets the marketing team escalate any item to the concerned person through a one-item magic link. There are no user accounts. Access is either the shared marketing password or a magic link.
 
 - **Frontend:** React (JS) + Vite SPA, Poppins, lucide-react
-- **Backend:** one Node router (`server/router.js`) served as a Vercel function (`api/[...route].js`) in production and by `server/dev.js` locally
+- **Backend:** one Node router (`server/router.js`) served as a Vercel function (`api/index.js`) in production and by `server/dev.js` locally
 - **Data:** Supabase Postgres, reached only through the backend with the service-role key
-- **Classification:** keyword rules only (no AI service). Mail the rules can't place goes to an admin-only **Needs sorting** tab, where the team moves it to the right tab with one click.
+- **Classification:** keyword rules only (no AI service). Anything the rules can't place goes to an admin-only **Needs sorting** tab, where the team moves it to the right tab with one click.
 - **Email out:** Resend
 
 ## Run locally
@@ -13,7 +13,7 @@ Internal dashboard that pulls emails from `marketingext@zopper.com`, sorts them 
 ```bash
 npm install
 cp .env.example .env        # fill in the values, see below
-# run the files in supabase/migrations/ in order (0001, 0002) in the Supabase SQL editor
+# run the files in supabase/migrations/ in order (0001 to 0004) in the Supabase SQL editor
 npm run dev                 # web on :5173, API on :8787 (Vite proxies /api)
 npm test                    # access-control + classifier tests (no network or keys needed)
 ```
@@ -30,40 +30,28 @@ Minimum to see the dashboard: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `ADMI
 | `APP_URL` | magic links and the logo in emails | defaults to `http://localhost:5173` |
 | `MAGIC_LINK_TTL_DAYS` | link expiry | 7 |
 | `RESEND_API_KEY`, `MAIL_FROM` | sending escalation emails | the modal shows the link so it can be shared by hand |
-| `GMAIL_MAILBOX`, `GOOGLE_SERVICE_ACCOUNT_JSON` | ingestion | "Sync" fails; items can only be added to the DB by hand |
+| `WEBFLOW_API_TOKEN`, `WEBFLOW_SITE_ID` | pulling form submissions | "Sync" reports "not configured" and nothing is imported |
+| `WEBFLOW_FORMS`, `WEBFLOW_LOOKBACK_DAYS`, `WEBFLOW_MAX_PER_RUN` | which forms, how far back, batch size | the two lead forms, 90 days, 300 per run |
 | `CRON_SECRET` | scheduled `/api/ingest` | only an admin can trigger sync |
-| `INGEST_LOOKBACK_DAYS`, `INGEST_MAX_PER_RUN` | ingestion window and batch size | 3 days, 20 per run |
 
 `MAIL_FROM` must use a domain verified in Resend. Until then Resend only delivers to your own account's address.
 
-## Gmail ingestion setup (one-off)
-
-The credentials come from **Google Cloud Console**, but one step happens in the **Google Workspace Admin console** (step 3) and needs a Workspace super admin. `marketingext@zopper.com` must be a Google Workspace mailbox.
-
-1. In [Google Cloud Console](https://console.cloud.google.com), create a project and enable the **Gmail API** (APIs & Services → Library).
-2. IAM & Admin → Service Accounts → create one → Keys → Add key → JSON. Keep the file private. Note the service account's numeric **Client ID** (Details tab → Advanced settings).
-3. In [Workspace Admin](https://admin.google.com) → Security → Access and data control → API controls → **Domain-wide delegation** → Add new, with that Client ID and the scope `https://www.googleapis.com/auth/gmail.readonly`.
-4. Set `GOOGLE_SERVICE_ACCOUNT_JSON` to the key file's contents (raw JSON, or base64 of it) and `GMAIL_MAILBOX=marketingext@zopper.com`.
-5. Set `CRON_SECRET` to a random string and deploy.
-
-Each run looks at the inbox for the last `INGEST_LOOKBACK_DAYS` days, skips anything already recorded in `ingested_messages`, and processes up to `INGEST_MAX_PER_RUN` new messages. A message that fails to process isn't recorded, so the next run retries it.
-
 ## Webflow form submissions
 
-The two website forms **"Lead Generation (Contact Page)"** and **"Lead Generation (Component)"** are pulled in alongside Gmail (override with `WEBFLOW_FORMS`, names separated by `|`). Every other form on the site (newsletter, program sign-ups, quote forms) is ignored.
+The two website forms **"Lead Generation (Contact Page)"** and **"Lead Generation (Component)"** are the only source (override with `WEBFLOW_FORMS`, names separated by `|`). Every other form on the site (newsletter, program sign-ups, quote forms) is ignored.
 
 - **Read-only.** `server/lib/webflow.js` is the only code that talks to Webflow and it only sends `GET` requests. Nothing is created, edited, deleted or published on the Webflow site.
 - Setup: Webflow → Site settings → Apps & integrations → API access → generate a site token (read access to forms is enough). Set `WEBFLOW_API_TOKEN` and `WEBFLOW_SITE_ID`.
-- Runs in the same daily job and **Sync** button as Gmail. Each submission is stored once (de-duplicated as `webflow:<id>`); `WEBFLOW_LOOKBACK_DAYS` (default 90) bounds how far back it looks.
+- Runs in a daily job (see Deploy) and on the dashboard's **Sync** button. A submission that fails to process isn't recorded, so the next run retries it. Each submission is stored once (de-duplicated as `webflow:<id>`); `WEBFLOW_LOOKBACK_DAYS` (default 90) bounds how far back it looks.
 - Mapping: sender = Email, name = First + Last Name, subject = `Contact form – <Organisation>`, message = the form's free-text box (Webflow calls it "Field"). Organisation, designation and phone are appended to the full message. Sorting is based on the message only.
 
 ## Only new entries, ever
 
-Every Gmail message and Webflow submission is recorded by id in `ingested_messages` the first time it's seen, whatever happens to it afterwards (stored, dropped as a job seeker, deleted, archived, moved). A sync only handles ids it hasn't recorded, so old items are never re-added, never overwritten, and a deleted item never returns. Overlapping syncs are safe because `source_id` is unique in the database. `server/test/ingest.test.js` covers this.
+Every Webflow submission is recorded by id in `ingested_messages` the first time it's seen, whatever happens to it afterwards (stored, dropped as a job seeker, deleted, archived, moved). A sync only handles ids it hasn't recorded, so old items are never re-added, never overwritten, and a deleted item never returns. Overlapping syncs are safe because `source_id` is unique in the database. `server/test/ingest.test.js` covers this.
 
 ## Deploy (Vercel)
 
-Import the repo, set the env vars above, deploy. `vercel.json` rewrites every non-`/api` path to the SPA and runs `/api/ingest` once a day at 04:00 UTC (09:30 IST), which fits Vercel's free plan. Admins can also press **Sync** in the dashboard at any time to pull new mail immediately.
+Import the repo, set the env vars above, deploy. `vercel.json` rewrites every non-`/api` path to the SPA and runs `/api/ingest` once a day at 04:00 UTC (09:30 IST), which fits Vercel's free plan. Admins can also press **Sync** in the dashboard at any time to pull new submissions immediately. Set `CRON_SECRET` on Vercel so the scheduled run is authorised.
 
 ## How access works
 
@@ -73,7 +61,7 @@ Import the repo, set the env vars above, deploy. `vercel.json` rewrites every no
 
 ## Defaults I chose for the open assumptions (change if wrong)
 
-1. **Ingestion:** Gmail API polling (daily, plus the Sync button) with a delegated service account, not Pub/Sub push. If the mailbox is on Exchange/Outlook, replace `server/lib/gmail.js`; the rest is unchanged.
+1. **Ingestion:** Webflow's form-submissions API, polled daily plus the Sync button (no webhooks). An earlier version also read a Gmail mailbox; that was removed because only the website forms are used. It's in the git history (`server/lib/gmail.js`) if it's ever needed again.
 2. **Admin access:** shared password plus name dropdown, as specified. There's no per-person revocation or rate limiting beyond a 600 ms delay on failed logins. Consider a longer, non-guessable password.
 3. **Link expiry:** 7 days (`MAGIC_LINK_TTL_DAYS`).
 4. **Email provider:** Resend.
@@ -84,8 +72,8 @@ Import the repo, set the env vars above, deploy. `vercel.json` rewrites every no
 - Added a third category, **`unsorted`**, shown on an admin-only "Needs sorting" tab (magic links can never reach it). Items there can't be escalated until they're moved to Partnership or Complaints / Enquiries.
 - The `partnership_status` / `complaint_status` enums are replaced by one check constraint on `status` that allows the right values per category (and the API validates too).
 - `magic_links.token` is stored as **`token_hash`** (SHA-256) so a database leak doesn't expose live links.
-- Added `mail_items.gmail_message_id` / `gmail_thread_id` and an `ingested_messages` table for de-duplication, including messages that were ignored.
-- Added an `ignore` outcome in classification: auto-replies, bounces and no-reply senders aren't stored.
+- Added `mail_items.source_id` and an `ingested_messages` table for de-duplication, including submissions that were ignored. (Column names still carry a `source` / `mail_` flavour from the earlier Gmail version.)
+- Added an `ignore` outcome in classification: auto-replies, bounces, no-reply senders and job seekers aren't stored.
 - Choosing "Escalated to team" in the dropdown opens the escalate dialog for marketing users, since escalation needs a recipient. Escalating a partnership records the recipient but leaves its status alone (there's no escalated state for partnerships).
 
 ## How the rules classify
@@ -103,9 +91,9 @@ Admins can correct any wrong guess with **Move to Partnership / Complaints** on 
 ## Layout
 
 ```
-api/[...route].js            Vercel entry, calls server/router.js
+api/index.js                 Vercel entry (vercel.json rewrites every /api/... path here), calls server/router.js
 server/router.js             routes + handlers
-server/lib/                  auth, supabase, gmail, ingest, classify, mail
+server/lib/                  auth, supabase, webflow, ingest, classify, mail
 server/test/                 node:test suites
 supabase/migrations/         schema
 src/                         React app (components/, api.js, sections.js, styles.css)

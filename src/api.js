@@ -11,7 +11,7 @@ export const setMagicToken = (token) => {
   magicToken = token || null;
 };
 
-async function request(path, { method = 'GET', body } = {}) {
+async function attempt(path, { method = 'GET', body } = {}) {
   let response;
   try {
     response = await fetch(`/api${path}`, {
@@ -27,8 +27,29 @@ async function request(path, { method = 'GET', body } = {}) {
     throw new ApiError(0, "Can't reach the server. Check your connection and try again.");
   }
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new ApiError(response.status, data.error || 'Something went wrong');
+  if (!response.ok) {
+    // No JSON error body usually means the server itself was briefly down (restart, cold start).
+    const fallback = response.status >= 500 ? "The server didn't respond. Please try again in a moment." : 'Something went wrong';
+    throw new ApiError(response.status, data.error || fallback);
+  }
   return data;
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Reads are safe to repeat, so a brief outage is retried instead of shown to the user.
+// Writes (status changes, escalations, deletes) are never retried automatically.
+async function request(path, options = {}) {
+  const isRead = !options.method || options.method === 'GET';
+  for (let tries = 0; ; tries += 1) {
+    try {
+      return await attempt(path, options);
+    } catch (error) {
+      const transient = error.status === 0 || error.status >= 500;
+      if (!isRead || !transient || tries >= 2) throw error;
+      await sleep(600 * (tries + 1));
+    }
+  }
 }
 
 export const api = {

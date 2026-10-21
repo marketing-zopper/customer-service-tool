@@ -318,6 +318,29 @@ test('ingest endpoint: needs cron secret or admin', async () => {
   delete process.env.CRON_SECRET;
 });
 
+test('Vercel-style forwarded paths reach every route (nested paths, methods, query strings)', async () => {
+  resetDb();
+  const cookie = await adminCookie();
+  // /api/items/<id> arrives as /api?__path=items/<id> after Vercel's rewrite
+  const detail = await call(`/api?__path=items/${ITEM_C}`, { cookie });
+  assert.equal(detail.status, 200);
+  assert.equal(detail.data.item.body_full, 'full body');
+  // encoded slashes, as a proxy may send them
+  assert.equal((await call(`/api?__path=items%2F${ITEM_C}`, { cookie })).status, 200);
+  // the original query string still arrives alongside __path
+  const list = await call('/api?__path=items&category=partnership', { cookie });
+  assert.deepEqual(list.data.items.map((i) => i.id), [ITEM_P]);
+  // methods and 3-segment paths
+  const status = await call(`/api?__path=items/${ITEM_C}/status`, { method: 'PATCH', body: { status: 'resolved' }, cookie });
+  assert.equal(status.data.item.status, 'resolved');
+  assert.equal((await call(`/api?__path=items/${ITEM_C}/archive`, { method: 'PATCH', body: { archived: true }, cookie })).status, 200);
+  assert.equal((await call(`/api?__path=items/${ITEM_P}`, { method: 'DELETE', cookie })).status, 409); // routed, then refused by rule
+  // single-segment and unknown paths
+  assert.equal((await call('/api?__path=session')).data.role, 'anon');
+  assert.equal((await call('/api?__path=nope/deeper')).status, 404);
+  assert.equal((await call('/api')).status, 404);
+});
+
 test('unknown routes and methods', async () => {
   assert.equal((await call('/api/nope')).status, 404);
   assert.equal((await call('/api/login')).status, 405);
