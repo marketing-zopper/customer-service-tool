@@ -70,8 +70,12 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
     load();
   }, [load]);
 
+  // A change can finish after you've moved on (switched tab, opened the archive) and the list is
+  // empty while the next one loads, so every update must cope with "no list right now".
+  const updateItems = (change) => setItems((current) => (current ? change(current) : current));
+
   const patchItem = (id, patch) =>
-    setItems((current) => current.map((item) => (item.id === id ? { ...item, ...patch } : item)));
+    updateItems((current) => current.map((item) => (item.id === id ? { ...item, ...patch } : item)));
 
   async function changeStatus(item, status) {
     if (status === item.status) return;
@@ -91,21 +95,20 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
   }
 
   async function moveItem(item, category) {
-    const previous = items;
-    setItems((current) => current.filter((i) => i.id !== item.id));
+    updateItems((current) => current.filter((i) => i.id !== item.id));
     try {
       await api.setCategory(item.id, category);
       showToast(`Moved to ${category === 'partnership' ? 'Partnership' : 'Complaints / Enquiries'}`);
     } catch (err) {
-      setItems(previous);
       showToast(err.message, 'error');
+      await loadRef.current(); // put the real list back (the one on screen may no longer be the one it was removed from)
     }
   }
 
   async function archiveItem(item, archived) {
     try {
       await api.setArchived(item.id, archived);
-      setItems((current) => current.filter((i) => i.id !== item.id));
+      updateItems((current) => current.filter((i) => i.id !== item.id));
       setArchivedCount((count) => Math.max(0, count + (archived ? 1 : -1)));
       showToast(archived ? 'Archived' : 'Restored');
     } catch (err) {
@@ -116,7 +119,7 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
   async function deleteItem(item) {
     try {
       await api.deleteItem(item.id);
-      setItems((current) => current.filter((i) => i.id !== item.id));
+      updateItems((current) => current.filter((i) => i.id !== item.id));
       showToast('Deleted');
     } catch (err) {
       showToast(err.message, 'error');
