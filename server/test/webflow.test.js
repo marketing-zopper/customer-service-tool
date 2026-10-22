@@ -42,8 +42,12 @@ test('copes with missing fields', () => {
   assert.equal(item.snippet, '');
 });
 
+// What the rules actually decided. Anything they couldn't place is filed under Partnership (the
+// catch-all) but flagged `confident: false`; "unsorted" here means exactly that.
+const verdict = (result) => (result.outcome === 'partnership' && result.confident === false ? 'unsorted' : result.outcome);
+
 test('a senior person at a named organisation with a bare product enquiry is a partnership', () => {
-  const sort = (response) => classifyEmail(toItem(submission(response))).outcome;
+  const sort = (response) => verdict(classifyEmail(toItem(submission(response))));
   const axis = { Field: 'Interested in the insurance tech product.', Organisation: 'Axis Bank', Designation: 'VP' };
   assert.equal(sort(axis), 'partnership');
   // no real organisation / title: nothing to go on, so a human decides
@@ -62,12 +66,20 @@ test('a senior person at a named organisation with a bare product enquiry is a p
 test('an embedded-insurance pitch is a partnership even without a senior title', () => {
   const pitch =
     'Hello, I run NextEscaype, a registered tourism marketplace in Andhra Pradesh built for solo travellers, connecting them with verified local guides, homestays and vehicle rentals. Our apps are live on Google Play and we are completing an online payment flow ahead of a wider launch. We would like to embed per-trip group personal accident cover with accidental medical expenses for travellers, opt-in at the payment step, premium collected by us and passed on. Could you share: the underwriting insurer, the policy wording and sum insured, exclusions (especially trekking and two-wheeler use), per-trip premium, any minimum commitment or setup fee, the prepaid wallet or billing model, and the claims process. We are API-ready. Thank you.';
-  assert.equal(classifyEmail(toItem(submission({ Field: pitch, Designation: 'NA' }))).outcome, 'partnership');
+  assert.equal(verdict(classifyEmail(toItem(submission({ Field: pitch, Designation: 'NA' })))), 'partnership');
+});
+
+test('messages the rules cannot place are filed under Partnership, flagged as unsure', () => {
+  const result = classifyEmail(toItem(submission({ Field: 'Hello there', Designation: 'NA' })));
+  assert.equal(result.outcome, 'partnership');
+  assert.equal(result.confident, false);
+  const decided = classifyEmail(toItem(submission({ Field: 'I have a complaint, my refund claim is unresolved.' })));
+  assert.deepEqual([decided.outcome, decided.confident], ['complaint_enquiry', true]);
 });
 
 test('web enquiries are sorted by what the message says', () => {
   // junk designation: this test is about the message alone
-  const sort = (message) => classifyEmail(toItem(submission({ Field: message, Designation: 'NA' }))).outcome;
+  const sort = (message) => verdict(classifyEmail(toItem(submission({ Field: message, Designation: 'NA' }))));
   assert.equal(sort('We are interested in a white-label API partnership and integration.'), 'partnership');
   assert.equal(sort('I have a complaint, my refund claim is unresolved.'), 'complaint_enquiry');
   assert.equal(sort('Please send a quotation for employee health insurance'), 'lead');

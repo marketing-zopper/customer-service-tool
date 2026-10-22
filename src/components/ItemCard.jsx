@@ -11,7 +11,7 @@ const dateFormat = new Intl.DateTimeFormat('en-IN', {
   minute: '2-digit',
 });
 
-export default function ItemCard({ item, statuses, canEscalate, onStatusChange, onEscalate, onSort, onMove, onDelete, onArchive, archived }) {
+export default function ItemCard({ item, statuses, canNotify, onStatusChange, onNotify, onMove, onDelete, onArchive, archived }) {
   const [confirming, setConfirming] = useState(false);
   const otherCategory = item.category === 'partnership' ? 'complaint_enquiry' : 'partnership';
   const otherLabel = otherCategory === 'partnership' ? 'Partnership' : 'Complaints';
@@ -57,11 +57,11 @@ export default function ItemCard({ item, statuses, canEscalate, onStatusChange, 
           (item.assigned_email_status === 'failed' ? (
             <p className="assigned assigned--failed">
               <TriangleAlert size={14} aria-hidden="true" /> Email to <strong>{item.assigned_to}</strong> was not sent. Use
-              Escalate to try again.
+              Notify to try again.
             </p>
           ) : (
             <p className="assigned">
-              <UserCheck size={14} aria-hidden="true" /> Escalated to <strong>{item.assigned_to}</strong>
+              <UserCheck size={14} aria-hidden="true" /> Notified: <strong>{item.assigned_to}</strong>
             </p>
           ))}
 
@@ -88,53 +88,42 @@ export default function ItemCard({ item, statuses, canEscalate, onStatusChange, 
         </button>
       </div>
 
-      {onSort ? (
-        <div className="card-actions">
-          <span className="sort-label">Move to</span>
-          <button className="btn btn--ghost btn--sm" onClick={() => onSort(item, 'partnership')}>
-            Partnership
+      <div className="card-actions">
+        <StatusSelect value={item.status} options={statuses} onChange={(status) => onStatusChange(item, status)} />
+        {canNotify && (
+          <button className="btn btn--escalate" onClick={() => onNotify(item)}>
+            <Send size={15} aria-hidden="true" /> Notify
           </button>
-          <button className="btn btn--ghost btn--sm" onClick={() => onSort(item, 'complaint_enquiry')}>
-            Complaints / Enquiries
+        )}
+        {onMove && (
+          <button className="link-btn link-btn--muted" onClick={() => onMove(item, otherCategory)}>
+            <ArrowRightLeft size={13} aria-hidden="true" /> Move to {otherLabel}
           </button>
-          {onDelete &&
-            (confirming ? (
-              <div className="confirm">
-                <span>Delete permanently?</span>
-                <button className="btn btn--danger btn--sm" onClick={() => onDelete(item)}>
-                  Delete
-                </button>
-                <button className="btn btn--ghost btn--sm" onClick={() => setConfirming(false)}>
-                  Keep
-                </button>
-              </div>
-            ) : (
-              <button className="link-btn link-btn--danger" onClick={() => setConfirming(true)}>
-                <Trash2 size={13} aria-hidden="true" /> Delete
+        )}
+        {onArchive && (
+          <button className="link-btn link-btn--muted" onClick={() => onArchive(item, !archived)}>
+            {archived ? <ArchiveRestore size={13} aria-hidden="true" /> : <Archive size={13} aria-hidden="true" />}
+            {archived ? 'Restore' : 'Archive'}
+          </button>
+        )}
+        {onDelete &&
+          !archived &&
+          (confirming ? (
+            <div className="confirm">
+              <span>Delete permanently?</span>
+              <button className="btn btn--danger btn--sm" onClick={() => onDelete(item)}>
+                Delete
               </button>
-            ))}
-        </div>
-      ) : (
-        <div className="card-actions">
-          <StatusSelect value={item.status} options={statuses} onChange={(status) => onStatusChange(item, status)} />
-          {canEscalate && (
-            <button className="btn btn--escalate" onClick={() => onEscalate(item)}>
-              <Send size={15} aria-hidden="true" /> Escalate
+              <button className="btn btn--ghost btn--sm" onClick={() => setConfirming(false)}>
+                Keep
+              </button>
+            </div>
+          ) : (
+            <button className="link-btn link-btn--danger" onClick={() => setConfirming(true)}>
+              <Trash2 size={13} aria-hidden="true" /> Delete
             </button>
-          )}
-          {onMove && (
-            <button className="link-btn link-btn--muted" onClick={() => onMove(item, otherCategory)}>
-              <ArrowRightLeft size={13} aria-hidden="true" /> Move to {otherLabel}
-            </button>
-          )}
-          {onArchive && (
-            <button className="link-btn link-btn--muted" onClick={() => onArchive(item, !archived)}>
-              {archived ? <ArchiveRestore size={13} aria-hidden="true" /> : <Archive size={13} aria-hidden="true" />}
-              {archived ? 'Restore' : 'Archive'}
-            </button>
-          )}
-        </div>
-      )}
+          ))}
+      </div>
     </article>
   );
 }

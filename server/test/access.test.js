@@ -22,9 +22,10 @@ const inFuture = new Date(Date.now() + 86_400_000).toISOString();
 const inPast = new Date(Date.now() - 86_400_000).toISOString();
 
 const tables = {};
+const sentEmails = [];
 function resetDb() {
   const item = (id, category, extra = {}) => ({
-    id, category, status: 'in_review', subject: `Subject ${id.slice(0, 2)}`, sender_email: 's@x.com',
+    id, category, status: 'active', subject: `Subject ${id.slice(0, 2)}`, sender_email: 's@x.com',
     sender_name: 'Sender', body_snippet: 'snippet', body_full: 'full body', received_at: '2026-01-01T00:00:00Z',
     assigned_to: null, updated_at: '2026-01-01T00:00:00Z', is_lead: false, ...extra,
   });
@@ -83,7 +84,15 @@ let server;
 let base;
 
 before(async () => {
-  globalThis.fetch = (url, init) => (String(url).startsWith(process.env.SUPABASE_URL) ? Promise.resolve(fakeSupabase(String(url), init)) : realFetch(url, init));
+  globalThis.fetch = (url, init) => {
+    const href = String(url);
+    if (href.startsWith(process.env.SUPABASE_URL)) return Promise.resolve(fakeSupabase(href, init));
+    if (href === 'https://api.resend.com/emails') {
+      sentEmails.push(JSON.parse(init.body));
+      return Promise.resolve(new Response('{"id":"test"}', { status: 200 }));
+    }
+    return realFetch(url, init);
+  };
   server = createServer(handle);
   await new Promise((resolve) => server.listen(0, resolve));
   base = `http://127.0.0.1:${server.address().port}`;
@@ -174,33 +183,45 @@ test('expired and unknown tokens are invalid', async () => {
   assert.equal((await call('/api/items?category=complaint_enquiry', { token: 'expired-link-token-complaint-xx' })).status, 401);
 });
 
-test('status updates are validated per category and scoped', async () => {
+test('status updates: the shared status set, validated and scoped', async () => {
   resetDb();
   const token = 'item-link-token-for-complaint-1';
-  const bad = await call(`/api/items/${ITEM_C}/status`, { method: 'PATCH', body: { status: 'accepted' }, token });
-  assert.equal(bad.status, 400);
-  const ok = await call(`/api/items/${ITEM_C}/status`, { method: 'PATCH', body: { status: 'resolved' }, token });
-  assert.equal(ok.data.item.status, 'resolved');
-  const outOfScope = await call(`/api/items/${ITEM_C2}/status`, { method: 'PATCH', body: { status: 'resolved' }, token });
-  assert.equal(outOfScope.status, 403);
-  assert.equal(tables.mail_items.find((i) => i.id === ITEM_C2).status, 'in_review');
+  const set = (id, status, opts) => call(`/api/items/${id}/status`, { method: 'PATCH', body: { status }, ...opts });
+
+  // the old per-tab statuses are gone
+  for (const old of ['accepted', 'rejected', 'escalated_to_team', 'bogus']) assert.equal((await set(ITEM_C, old, { token })).status, 400, old);
+  // all four current statuses work on both tabs
+  const cookie = await adminCookie();
+  for (const status of ['active', 'in_review', 'notified', 'resolved']) {
+    assert.equal((await set(ITEM_C, status, { cookie })).data.item.status, status);
+    assert.equal((await set(ITEM_P, status, { cookie })).data.item.status, status);
+  }
+  assert.equal((await set(ITEM_C, 'resolved', { token })).data.item.status, 'resolved'); // a link holder can update their item
+  assert.equal((await set(ITEM_C2, 'resolved', { token })).status, 403); // but not another one
+  assert.equal(tables.mail_items.find((i) => i.id === ITEM_C2).status, 'active');
 });
 
-test('escalation is admin-only, stores a hashed link, and marks complaints escalated', async () => {
+test('notify: admin-only, needs both emails, stores a hashed link, marks the item notified', async () => {
   resetDb();
-  const body = { itemId: ITEM_C, email: 'Boss@Zopper.com' };
+  const body = { itemId: ITEM_C, email: 'Boss@Zopper.com', ccEmail: 'Me@Zopper.com' };
   assert.equal((await call('/api/escalate', { method: 'POST', body, token: 'item-link-token-for-complaint-1' })).status, 403);
   assert.equal((await call('/api/escalate', { method: 'POST', body })).status, 401);
 
   const cookie = await adminCookie();
-  assert.equal((await call('/api/escalate', { method: 'POST', body: { itemId: ITEM_C, email: 'not-an-email' }, cookie })).status, 400);
+  const send = (b) => call('/api/escalate', { method: 'POST', body: b, cookie });
+  assert.equal((await send({ ...body, email: 'not-an-email' })).status, 400);
+  // the sender's own email is required, so they can be copied
+  assert.equal((await send({ itemId: ITEM_C, email: 'boss@zopper.com' })).status, 400);
+  assert.equal((await send({ ...body, ccEmail: '' })).status, 400);
+  assert.equal((await send({ ...body, ccEmail: 'nope' })).status, 400);
 
   const before = tables.magic_links.length;
-  const done = await call('/api/escalate', { method: 'POST', body, cookie });
+  const done = await send(body);
   assert.equal(done.status, 200);
-  assert.equal(done.data.item.status, 'escalated_to_team');
+  assert.equal(done.data.item.status, 'notified');
   assert.equal(done.data.item.assigned_to, 'boss@zopper.com');
-  assert.equal(done.data.emailSent, false); // no RESEND_API_KEY in tests -> link handed back
+  assert.equal(done.data.ccEmail, 'me@zopper.com');
+  assert.equal(done.data.emailSent, false); // no RESEND_API_KEY here -> link handed back
   assert.equal(done.data.item.assigned_email_status, 'failed'); // the card must not claim it was emailed
   assert.equal(tables.magic_links.length, before + 1);
 
@@ -210,46 +231,77 @@ test('escalation is admin-only, stores a hashed link, and marks complaints escal
   assert.equal(url.pathname, '/dashboard/complaints');
   assert.equal(stored.token_hash, hashToken(token));
   assert.ok(!JSON.stringify(stored).includes(token));
-  assert.equal(stored.created_by, 'Arpit Jain');
+  assert.equal(stored.created_by, 'Arpit Jain <me@zopper.com>');
   assert.equal(stored.mail_item_id, ITEM_C);
 
   // The generated link actually works, and only for that item.
   assert.deepEqual((await call('/api/items?category=complaint_enquiry', { token })).data.items.map((i) => i.id), [ITEM_C]);
 });
 
-test('escalating a partnership keeps its status', async () => {
+test('notify works the same on a partnership and sets it to notified', async () => {
   resetDb();
   const cookie = await adminCookie();
-  const done = await call('/api/escalate', { method: 'POST', body: { itemId: ITEM_P, email: 'ceo@zopper.com' }, cookie });
-  assert.equal(done.data.item.status, 'in_review');
+  const done = await call('/api/escalate', { method: 'POST', body: { itemId: ITEM_P, email: 'ceo@zopper.com', ccEmail: 'me@zopper.com' }, cookie });
+  assert.equal(done.data.item.status, 'notified');
   assert.equal(done.data.item.assigned_to, 'ceo@zopper.com');
 });
 
-test('"Needs sorting": admin-only, can be sorted by admins, cannot be escalated while unsorted', async () => {
+test('notify sends the full details to the recipient, copies and sets reply-to to the sender', async () => {
   resetDb();
-  const UNSORTED = '55555555-5555-5555-5555-555555555555';
-  tables.mail_items.push({ ...tables.mail_items[0], id: UNSORTED, category: 'unsorted' });
+  const item = tables.mail_items.find((i) => i.id === ITEM_C);
+  item.sender_name = 'Asha Rao';
+  item.sender_email = 'asha@acme.com';
+  item.body_full = `${'Line one of a long complaint. '.repeat(30)}\n\nSecond paragraph <b>kept</b>.\n\nOrganisation: Acme\nDesignation: Director\nPhone: 9999900000\nSubmitted via: Lead Generation (Contact Page) (/contact-us)`;
+  process.env.RESEND_API_KEY = 're_test';
+  sentEmails.length = 0;
+  try {
+    const cookie = await adminCookie();
+    const done = await call('/api/escalate', { method: 'POST', body: { itemId: ITEM_C, email: 'Boss@zopper.com', ccEmail: 'me@zopper.com', note: 'Please call today' }, cookie });
+    assert.equal(done.data.emailSent, true);
+    assert.equal(done.data.link, undefined); // the raw link is not returned when the email went out
+    assert.equal(done.data.item.assigned_email_status, 'sent');
+    assert.equal(sentEmails.length, 1);
+
+    const mail = sentEmails[0];
+    assert.deepEqual(mail.to, ['boss@zopper.com']);
+    assert.deepEqual(mail.cc, ['me@zopper.com']);
+    assert.equal(mail.reply_to, 'me@zopper.com');
+    assert.match(mail.subject, /^\[Complaint \/ Enquiry\]/);
+    for (const part of [mail.html, mail.text]) {
+      assert.ok(part.includes('Second paragraph'));
+      assert.ok(part.includes('Asha Rao'));
+      assert.ok(part.includes('asha@acme.com'));
+      assert.ok(part.includes('9999900000'));
+      assert.ok(part.includes('Acme'));
+      assert.ok(part.includes('Director'));
+      assert.ok(part.includes('Please call today'));
+      assert.ok(part.includes('/dashboard/complaints?token='));
+    }
+    // the whole message is there, not a preview, and it is HTML-escaped
+    assert.equal((mail.text.match(/Line one of a long complaint\./g) || []).length, 30);
+    assert.ok(mail.html.includes('&lt;b&gt;kept&lt;/b&gt;'));
+    assert.ok(!mail.html.includes('<b>kept</b>'));
+  } finally {
+    delete process.env.RESEND_API_KEY;
+  }
+});
+
+test('moving an item between tabs resets it to active; there is no "unsorted" tab any more', async () => {
+  resetDb();
   const cookie = await adminCookie();
   const linkToken = 'item-link-token-for-complaint-1';
+  const move = (id, category, opts) => call(`/api/items/${id}/category`, { method: 'PATCH', body: { category }, ...opts });
 
-  assert.deepEqual((await call('/api/items?category=unsorted', { cookie })).data.items.map((i) => i.id), [UNSORTED]);
-  assert.equal((await call('/api/items?category=unsorted', { token: linkToken })).status, 403);
-  assert.equal((await call(`/api/items/${UNSORTED}`, { token: linkToken })).status, 403);
+  assert.equal((await call('/api/items?category=unsorted', { cookie })).status, 400); // the Needs sorting tab is gone
+  assert.equal((await move(ITEM_C, 'partnership', { token: linkToken })).status, 403); // links can't move items
+  assert.equal((await move(ITEM_C, 'unsorted', { cookie })).status, 400);
 
-  const escalate = await call('/api/escalate', { method: 'POST', body: { itemId: UNSORTED, email: 'a@zopper.com' }, cookie });
-  assert.equal(escalate.status, 409);
-
-  const asLink = await call(`/api/items/${UNSORTED}/category`, { method: 'PATCH', body: { category: 'partnership' }, token: linkToken });
-  assert.equal(asLink.status, 403);
-  assert.equal((await call(`/api/items/${UNSORTED}/category`, { method: 'PATCH', body: { category: 'unsorted' }, cookie })).status, 400);
-
-  const moved = await call(`/api/items/${UNSORTED}/category`, { method: 'PATCH', body: { category: 'complaint_enquiry' }, cookie });
-  assert.equal(moved.data.item.category, 'complaint_enquiry');
-  assert.equal(moved.data.item.status, 'in_review');
-  // Already there: refused. A wrong guess can be corrected by moving it again.
-  assert.equal((await call(`/api/items/${UNSORTED}/category`, { method: 'PATCH', body: { category: 'complaint_enquiry' }, cookie })).status, 409);
-  const fixed = await call(`/api/items/${UNSORTED}/category`, { method: 'PATCH', body: { category: 'partnership' }, cookie });
-  assert.equal(fixed.data.item.category, 'partnership');
+  await call(`/api/items/${ITEM_C}/status`, { method: 'PATCH', body: { status: 'notified' }, cookie });
+  const moved = await move(ITEM_C, 'partnership', { cookie });
+  assert.equal(moved.data.item.category, 'partnership');
+  assert.equal(moved.data.item.status, 'active');
+  assert.equal((await move(ITEM_C, 'partnership', { cookie })).status, 409); // already there
+  assert.equal((await move(ITEM_C, 'complaint_enquiry', { cookie })).data.item.category, 'complaint_enquiry');
 });
 
 test('archive: admin-only, hides from the active list, restorable, never loses the item', async () => {
@@ -267,47 +319,42 @@ test('archive: admin-only, hides from the active list, restorable, never loses t
   assert.equal((await archive(ITEM_C, true, { cookie })).status, 200);
   assert.deepEqual(await ids('', { cookie }), [ITEM_C2]); // gone from the active list
   assert.deepEqual(await ids('&archived=1', { cookie }), [ITEM_C]); // present in the archive
-  assert.equal(tables.mail_items.find((i) => i.id === ITEM_C).status, 'in_review'); // status untouched
+  assert.equal(tables.mail_items.find((i) => i.id === ITEM_C).status, 'active'); // status untouched
 
   // only admins can open the archive; a link that was sent for this exact item still opens it
   assert.equal((await call('/api/items?category=partnership&archived=1', { token: 'section-link-token-partnership' })).status, 403);
   assert.deepEqual(await ids('', { token: 'item-link-token-for-complaint-1' }), [ITEM_C]);
 
-  // archived items can't be escalated until restored
-  const escalate = { method: 'POST', body: { itemId: ITEM_C, email: 'boss@zopper.com' }, cookie };
-  assert.equal((await call('/api/escalate', escalate)).status, 409);
+  // archived items can't be notified about until restored
+  const notify = { method: 'POST', body: { itemId: ITEM_C, email: 'boss@zopper.com', ccEmail: 'me@zopper.com' }, cookie };
+  assert.equal((await call('/api/escalate', notify)).status, 409);
 
   assert.equal((await archive(ITEM_C, false, { cookie })).status, 200);
   assert.deepEqual((await ids('', { cookie })).sort(), [ITEM_C, ITEM_C2].sort());
   assert.deepEqual(await ids('&archived=1', { cookie }), []);
 
-  // "Needs sorting" items and leads aren't archivable (they're sorted or deleted instead)
-  const UNSORTED = '77777777-7777-7777-7777-777777777777';
-  tables.mail_items.push({ ...tables.mail_items[0], id: UNSORTED, category: 'unsorted' });
-  assert.equal((await archive(UNSORTED, true, { cookie })).status, 409);
-  assert.equal((await archive(ITEM_LEAD, true, { cookie })).status, 404);
+  assert.equal((await archive(ITEM_LEAD, true, { cookie })).status, 404); // leads aren't reachable
 });
 
-test('delete: admin-only, only from Needs sorting, and the sync remembers it', async () => {
+test('delete: admin-only, Partnership items only, and the sync remembers it', async () => {
   resetDb();
-  const UNSORTED = '66666666-6666-6666-6666-666666666666';
-  tables.mail_items.push({ ...tables.mail_items[0], id: UNSORTED, category: 'unsorted', source_id: 'webflow:abc' });
-  tables.ingested_messages = [{ source_id: 'webflow:abc', outcome: 'unsorted' }];
+  const SPAM = '66666666-6666-6666-6666-666666666666';
+  tables.mail_items.push({ ...tables.mail_items[0], id: SPAM, category: 'partnership', source_id: 'webflow:abc' });
+  tables.ingested_messages = [{ source_id: 'webflow:abc', outcome: 'partnership' }];
   const cookie = await adminCookie();
   const remove = (id, opts) => call(`/api/items/${id}`, { method: 'DELETE', ...opts });
 
-  assert.equal((await remove(UNSORTED)).status, 401); // anonymous
-  assert.equal((await remove(UNSORTED, { token: 'item-link-token-for-complaint-1' })).status, 403); // magic link
-  // real Partnership / Complaint items can't be deleted from the app, and leads aren't reachable
-  assert.equal((await remove(ITEM_P, { cookie })).status, 409);
+  assert.equal((await remove(SPAM)).status, 401); // anonymous
+  assert.equal((await remove(SPAM, { token: 'item-link-token-for-complaint-1' })).status, 403); // magic link
+  // Complaints can only be archived, and leads aren't reachable
   assert.equal((await remove(ITEM_C, { cookie })).status, 409);
   assert.equal((await remove(ITEM_LEAD, { cookie })).status, 404);
-  assert.equal(tables.mail_items.some((i) => i.id === ITEM_P), true);
+  assert.equal(tables.mail_items.some((i) => i.id === ITEM_C), true);
 
-  assert.equal((await remove(UNSORTED, { cookie })).status, 200);
-  assert.equal(tables.mail_items.some((i) => i.id === UNSORTED), false);
+  assert.equal((await remove(SPAM, { cookie })).status, 200);
+  assert.equal(tables.mail_items.some((i) => i.id === SPAM), false);
   assert.equal(tables.ingested_messages[0].outcome, 'deleted'); // still "seen", so it isn't re-imported
-  assert.equal((await remove(UNSORTED, { cookie })).status, 404); // already gone
+  assert.equal((await remove(SPAM, { cookie })).status, 404); // already gone
 });
 
 test('ingest endpoint: needs cron secret or admin', async () => {
@@ -334,7 +381,7 @@ test('Vercel-style forwarded paths reach every route (nested paths, methods, que
   const status = await call(`/api?__path=items/${ITEM_C}/status`, { method: 'PATCH', body: { status: 'resolved' }, cookie });
   assert.equal(status.data.item.status, 'resolved');
   assert.equal((await call(`/api?__path=items/${ITEM_C}/archive`, { method: 'PATCH', body: { archived: true }, cookie })).status, 200);
-  assert.equal((await call(`/api?__path=items/${ITEM_P}`, { method: 'DELETE', cookie })).status, 409); // routed, then refused by rule
+  assert.equal((await call(`/api?__path=items/${ITEM_C}`, { method: 'DELETE', cookie })).status, 409); // routed, then refused by rule
   // single-segment and unknown paths
   assert.equal((await call('/api?__path=session')).data.role, 'anon');
   assert.equal((await call('/api?__path=nope/deeper')).status, 404);

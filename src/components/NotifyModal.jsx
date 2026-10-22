@@ -2,17 +2,35 @@ import { useEffect, useRef, useState } from 'react';
 import { Check, Copy, TriangleAlert, X } from 'lucide-react';
 import { api } from '../api.js';
 
-export default function EscalateModal({ item, onClose, onEscalated }) {
+// The employee's own address is remembered in this browser so they type it once, not on every item.
+const ccKey = (name) => `zst:notify-cc:${name}`;
+const readSaved = (name) => {
+  try {
+    return localStorage.getItem(ccKey(name)) || '';
+  } catch {
+    return '';
+  }
+};
+const save = (name, value) => {
+  try {
+    localStorage.setItem(ccKey(name), value);
+  } catch {
+    /* private mode etc.: just retype next time */
+  }
+};
+
+export default function NotifyModal({ item, adminName, onClose, onNotified }) {
+  const [ccEmail, setCcEmail] = useState(() => readSaved(adminName));
   const [email, setEmail] = useState(item.assigned_to || '');
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState(null);
   const [copied, setCopied] = useState(false);
-  const emailRef = useRef(null);
+  const firstEmpty = useRef(null);
 
   useEffect(() => {
-    emailRef.current?.focus();
+    firstEmpty.current?.focus();
     const onKey = (event) => event.key === 'Escape' && onClose();
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -23,8 +41,9 @@ export default function EscalateModal({ item, onClose, onEscalated }) {
     setBusy(true);
     setError('');
     try {
-      const response = await api.escalate(item.id, email, note);
-      onEscalated(response.item);
+      const response = await api.notify(item.id, email, ccEmail, note);
+      save(adminName, ccEmail.trim());
+      onNotified(response.item);
       setResult(response);
     } catch (err) {
       setError(err.message);
@@ -48,7 +67,7 @@ export default function EscalateModal({ item, onClose, onEscalated }) {
 
   return (
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="escalate-title">
+      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="notify-title">
         <button className="icon-btn modal-close" onClick={onClose} aria-label="Close">
           <X size={18} />
         </button>
@@ -58,11 +77,12 @@ export default function EscalateModal({ item, onClose, onEscalated }) {
             <div className={`panel-icon ${result.emailSent ? 'panel-icon--blue' : 'panel-icon--orange'}`}>
               {result.emailSent ? <Check size={22} aria-hidden="true" /> : <TriangleAlert size={22} aria-hidden="true" />}
             </div>
-            <h2 id="escalate-title">{result.emailSent ? 'Escalated' : 'Escalated, but email not sent'}</h2>
+            <h2 id="notify-title">{result.emailSent ? 'Notified' : 'Marked notified, but email not sent'}</h2>
             {result.emailSent ? (
               <p className="muted">
-                A link to this item was emailed to <strong>{email}</strong>
-                {expiry && <> and expires on {expiry}</>}.
+                The full details and a link to this item were emailed to <strong>{email}</strong>, with a copy to{' '}
+                <strong>{result.ccEmail}</strong>
+                {expiry && <>. The link expires on {expiry}</>}.
               </p>
             ) : (
               <>
@@ -85,13 +105,27 @@ export default function EscalateModal({ item, onClose, onEscalated }) {
           </div>
         ) : (
           <form onSubmit={submit}>
-            <h2 id="escalate-title">Escalate to concerned entity</h2>
+            <h2 id="notify-title">Notify concerned entity</h2>
             <p className="muted modal-subject">{item.subject || '(no subject)'}</p>
+
+            <label className="field">
+              <span>Your email</span>
+              <input
+                ref={ccEmail ? null : firstEmpty}
+                type="email"
+                value={ccEmail}
+                onChange={(e) => setCcEmail(e.target.value)}
+                placeholder="you@zopper.com"
+                autoComplete="email"
+                required
+              />
+              <small className="hint">You'll be copied on the email, and replies to it come to you.</small>
+            </label>
 
             <label className="field">
               <span>Their email</span>
               <input
-                ref={emailRef}
+                ref={ccEmail ? firstEmpty : null}
                 type="email"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
@@ -114,7 +148,8 @@ export default function EscalateModal({ item, onClose, onEscalated }) {
             </label>
 
             <p className="hint">
-              They'll get a link that opens only this item and lets them update its status. It expires after a few days.
+              They'll get the complete details of this query plus a link that opens only this item and lets them update its
+              status. The link expires after a few days.
             </p>
 
             {error && (
@@ -127,8 +162,8 @@ export default function EscalateModal({ item, onClose, onEscalated }) {
               <button type="button" className="btn btn--ghost" onClick={onClose}>
                 Cancel
               </button>
-              <button className="btn btn--escalate-solid" disabled={busy || !email}>
-                {busy ? 'Sending…' : 'Send link'}
+              <button className="btn btn--escalate-solid" disabled={busy || !email || !ccEmail}>
+                {busy ? 'Sending…' : 'Send notification'}
               </button>
             </div>
           </form>

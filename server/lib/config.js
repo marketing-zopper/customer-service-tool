@@ -1,19 +1,17 @@
-export const CATEGORIES = ['partnership', 'complaint_enquiry', 'unsorted'];
+export const CATEGORIES = ['partnership', 'complaint_enquiry'];
 
-// Categories an item can be moved into by hand from "Needs sorting"
-export const SORT_TARGETS = ['partnership', 'complaint_enquiry'];
-
+// Both tabs share one status set. 'active' is the default for new items; 'notified' is set
+// automatically when someone is notified about the item.
+export const STATUS_LIST = ['active', 'in_review', 'notified', 'resolved'];
 export const STATUSES = {
-  partnership: ['in_review', 'accepted', 'rejected'],
-  complaint_enquiry: ['in_review', 'escalated_to_team', 'resolved'],
-  unsorted: ['in_review'],
+  partnership: STATUS_LIST,
+  complaint_enquiry: STATUS_LIST,
 };
 
 // URL segment used by the dashboard for each category
 export const SECTION_SLUGS = {
   partnership: 'partnership',
   complaint_enquiry: 'complaints',
-  unsorted: 'sorting',
 };
 
 export function env(name, fallback) {

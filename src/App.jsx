@@ -38,8 +38,6 @@ function Shell() {
   };
 
   if (!SECTIONS[section]) return <Redirect to="/dashboard/partnership" />;
-  // "Needs sorting" is internal; a magic link never reaches it.
-  if (SECTIONS[section].adminOnly && session?.role === 'link') return <Redirect to={`/dashboard/${session.section}`} />;
   if (loadError) return <Restricted title="We couldn't load this page" message={loadError} onRetry={loadSession} />;
   if (!session) return <Splash />;
 
@@ -54,7 +52,7 @@ function Shell() {
       return (
         <Restricted
           title="This link has expired or isn't valid"
-          message="Magic links stop working after a few days. Ask the person who sent it to escalate the item again."
+          message="Magic links stop working after a few days. Ask the person who sent it to notify you about the item again."
           offerSignIn={() => setSession({ role: 'anon' })}
         />
       );

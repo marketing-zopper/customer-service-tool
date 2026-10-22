@@ -1,4 +1,4 @@
-import { CATEGORIES, SECTION_SLUGS, SORT_TARGETS, STATUSES, envInt } from './lib/config.js';
+import { CATEGORIES, SECTION_SLUGS, STATUSES, envInt } from './lib/config.js';
 import { HttpError, readJson, sendJson } from './lib/http.js';
 import { db, unwrap } from './lib/supabase.js';
 import {
@@ -13,7 +13,7 @@ import {
   requireItemScope,
   sessionCookie,
 } from './lib/auth.js';
-import { emailConfigured, magicLinkUrl, sendEscalationEmail } from './lib/mail.js';
+import { emailConfigured, magicLinkUrl, sendNotificationEmail } from './lib/mail.js';
 import { runIngest } from './lib/ingest.js';
 
 const LIST_COLUMNS =
@@ -103,13 +103,12 @@ const handlers = {
     return { items, archivedCount: count ?? 0 };
   },
 
-  // Archive / restore. Only for the two real tabs ("Needs sorting" items are moved or deleted instead).
+  // Archive / restore: hides an item from the active list without touching its status.
   async setArchived({ req, auth, params }) {
     requireAdmin(auth);
     const { archived } = await readJson(req);
     if (typeof archived !== 'boolean') throw new HttpError(400, 'archived must be true or false');
     const item = await getItem(params.id);
-    if (!SORT_TARGETS.includes(item.category)) throw new HttpError(409, 'Only Partnership and Complaint items can be archived');
 
     const updated = unwrap(
       await db()
@@ -140,26 +139,27 @@ const handlers = {
     return { item: updated };
   },
 
-  // Moves an item into Partnership or Complaints / Enquiries (out of "Needs sorting", or to fix a wrong guess).
+  // Moves an item to the other tab (fixes a wrong guess by the rules).
   async setCategory({ req, auth, params }) {
     requireAdmin(auth);
     const { category } = await readJson(req);
-    if (!SORT_TARGETS.includes(category)) throw new HttpError(400, 'Choose Partnership or Complaint / Enquiry');
+    if (!CATEGORIES.includes(category)) throw new HttpError(400, 'Choose Partnership or Complaint / Enquiry');
     const item = await getItem(params.id);
     if (item.category === category) throw new HttpError(409, 'This item is already there');
 
     const updated = unwrap(
-      await db().from('mail_items').update({ category, status: 'in_review' }).eq('id', item.id).select(LIST_COLUMNS).single(),
+      await db().from('mail_items').update({ category, status: 'active' }).eq('id', item.id).select(LIST_COLUMNS).single(),
     );
     return { item: updated };
   },
 
-  // Permanently removes an unwanted item. Only allowed from "Needs sorting"; real Partnership and
-  // Complaint items are never deleted from the app. The sync remembers the id, so it won't come back.
+  // Permanently removes an unwanted item (spam, off-topic). Only from Partnership, which is where
+  // anything the rules couldn't place lands; Complaints can only be archived. The sync remembers the
+  // id, so a deleted item never comes back.
   async deleteItem({ auth, params }) {
     requireAdmin(auth);
     const item = await getItem(params.id, `${LIST_COLUMNS},source_id`);
-    if (item.category !== 'unsorted') throw new HttpError(409, 'Only items in Needs sorting can be deleted');
+    if (item.category !== 'partnership') throw new HttpError(409, 'Only Partnership items can be deleted. Archive this one instead');
 
     unwrap(await db().from('mail_items').delete().eq('id', item.id));
     if (item.source_id) {
@@ -168,16 +168,19 @@ const handlers = {
     return { ok: true };
   },
 
+  // "Notify": emails the concerned person a one-item magic link plus the full details of the query,
+  // copying (and replying to) the employee who pressed the button.
   async escalate({ req, auth }) {
     requireAdmin(auth);
-    const { itemId, email, note } = await readJson(req);
+    const { itemId, email, ccEmail, note } = await readJson(req);
     const recipient = String(email || '').trim().toLowerCase();
-    if (!EMAIL_RE.test(recipient) || recipient.length > 254) throw new HttpError(400, 'Enter a valid email address');
+    if (!EMAIL_RE.test(recipient) || recipient.length > 254) throw new HttpError(400, 'Enter a valid email address for the person to notify');
+    const cc = String(ccEmail || '').trim().toLowerCase();
+    if (!EMAIL_RE.test(cc) || cc.length > 254) throw new HttpError(400, 'Enter your own email address. You will be copied on the notification');
     const cleanNote = String(note || '').trim().slice(0, 1000);
 
-    const item = await getItem(itemId);
-    if (item.category === 'unsorted') throw new HttpError(409, 'Sort this item into Partnership or Complaint / Enquiry first');
-    if (item.archived_at) throw new HttpError(409, 'Restore this item from the archive before escalating it');
+    const item = await getItem(itemId, DETAIL_COLUMNS);
+    if (item.archived_at) throw new HttpError(409, 'Restore this item from the archive before notifying about it');
     const ttlDays = envInt('MAGIC_LINK_TTL_DAYS', 7);
     const expiresAt = new Date(Date.now() + ttlDays * 86_400_000).toISOString();
     const token = newToken();
@@ -189,7 +192,7 @@ const handlers = {
         mail_item_id: item.id,
         recipient_email: recipient,
         expires_at: expiresAt,
-        created_by: auth.name,
+        created_by: `${auth.name} <${cc}>`,
       }),
     );
 
@@ -198,24 +201,27 @@ const handlers = {
     let emailError = null;
     if (emailConfigured()) {
       try {
-        await sendEscalationEmail({ to: recipient, item, url, escalatedBy: auth.name, note: cleanNote, expiresAt });
+        await sendNotificationEmail({ to: recipient, cc, item, url, notifiedBy: auth.name, note: cleanNote, expiresAt });
         emailSent = true;
       } catch (error) {
-        console.error('[escalate] email failed:', error.message);
+        console.error('[notify] email failed:', error.message);
         emailError = `The email could not be sent. ${error.message}`;
       }
     } else {
       emailError = 'Email sending is not configured (RESEND_API_KEY).';
     }
 
-    const changes = { assigned_to: recipient, assigned_email_status: emailSent ? 'sent' : 'failed' };
-    if (item.category === 'complaint_enquiry') changes.status = 'escalated_to_team';
     const updated = unwrap(
-      await db().from('mail_items').update(changes).eq('id', item.id).select(LIST_COLUMNS).single(),
+      await db()
+        .from('mail_items')
+        .update({ assigned_to: recipient, assigned_email_status: emailSent ? 'sent' : 'failed', status: 'notified' })
+        .eq('id', item.id)
+        .select(LIST_COLUMNS)
+        .single(),
     );
 
     // The raw link is only handed back when the email did not go out, so the sender can share it by hand.
-    return { item: updated, emailSent, emailError, expiresAt, ...(emailSent ? {} : { link: url }) };
+    return { item: updated, emailSent, emailError, expiresAt, ccEmail: cc, ...(emailSent ? {} : { link: url }) };
   },
 
   async ingest({ req, auth }) {

@@ -98,5 +98,5 @@ test('real customers and partners are not mistaken for job seekers', () => {
 test('classifyEmail ignores auto-replies and keeps the snippet otherwise', () => {
   assert.equal(classifyEmail(email({ fromEmail: 'noreply@x.com', subject: 'Partnership' })).outcome, 'ignore');
   const result = classifyEmail(email({ subject: 'Collaboration opportunity', body: 'Hi team', snippet: 'Hi team' }));
-  assert.deepEqual(result, { outcome: 'partnership', snippet: 'Hi team' });
+  assert.deepEqual(result, { outcome: 'partnership', snippet: 'Hi team', confident: true });
 });

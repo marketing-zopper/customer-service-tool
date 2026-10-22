@@ -1,39 +1,30 @@
 // The two dashboard views. `slug` is the URL segment, `category` matches the database enum.
+// Both share one status set: active (default for new items), in review, notified, resolved.
+const STATUSES = ['active', 'in_review', 'notified', 'resolved'];
+
 export const SECTIONS = {
   partnership: {
     slug: 'partnership',
     category: 'partnership',
     label: 'Partnership',
     tabLabel: 'Partnership',
-    statuses: ['in_review', 'accepted', 'rejected'],
-    emptyText: 'No partnership emails yet.',
+    statuses: STATUSES,
+    emptyText: 'No partnership items yet.',
   },
   complaints: {
     slug: 'complaints',
     category: 'complaint_enquiry',
     label: 'Complaints / Enquiries',
     tabLabel: 'Complaints',
-    statuses: ['in_review', 'escalated_to_team', 'resolved'],
+    statuses: STATUSES,
     emptyText: 'No complaints or enquiries yet.',
-  },
-  // Admin-only holding area for mail the keyword rules couldn't place
-  sorting: {
-    slug: 'sorting',
-    category: 'unsorted',
-    label: 'Needs sorting',
-    tabLabel: 'Needs sorting',
-    statuses: ['in_review'],
-    emptyText: 'Nothing waiting. Every email has been sorted.',
-    adminOnly: true,
-    description: "The rules couldn't tell where these belong. Move each one to the right tab.",
   },
 };
 
 export const STATUS_LABELS = {
+  active: 'Active',
   in_review: 'In review',
-  accepted: 'Accepted',
-  rejected: 'Rejected',
-  escalated_to_team: 'Escalated to team',
+  notified: 'Notified',
   resolved: 'Resolved',
 };
 

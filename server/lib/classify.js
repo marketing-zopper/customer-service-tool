@@ -2,7 +2,7 @@
  * Rules-only classification (no LLM). Outcome of classifying one email:
  *   partnership | complaint_enquiry   -> shown on that dashboard tab
  *   lead                              -> stored with is_lead = true, shown on neither tab
- *   unsorted                          -> rules can't tell; shown on the admin-only "Needs sorting" tab
+ *   unsorted                          -> (classifyByRules only) the rules can't tell; classifyEmail files it under partnership
  *   ignore                            -> auto-replies, bounces, no-reply senders, job seekers; not stored
  */
 
@@ -71,7 +71,7 @@ export function classifyByRules({ subject, bodyHead, businessContact = false }) 
  * @param {{ subject: string, fromEmail: string, body: string, classifyText?: string, businessContact?: boolean, snippet: string, headers: Record<string,string> }} email
  *   `classifyText`, when given, is judged instead of `body` (web forms: just the message, not the contact details).
  *   `businessContact` is set for web forms where the sender gave an organisation and a senior title.
- * @returns {{ outcome: 'partnership'|'complaint_enquiry'|'lead'|'unsorted'|'ignore', snippet: string }}
+ * @returns {{ outcome: 'partnership'|'complaint_enquiry'|'lead'|'ignore', snippet: string, confident?: boolean }}
  */
 export function classifyEmail(email) {
   if (isAutomated(email)) return { outcome: 'ignore', snippet: email.snippet };
@@ -82,6 +82,9 @@ export function classifyEmail(email) {
   if (isJobSeeker(`${email.subject}\n${head}`) && !hits(COMPLAINT_STRONG_RE, head) && hits(PARTNERSHIP_RE, head) < 2) {
     return { outcome: 'ignore', snippet: email.snippet };
   }
-  const outcome = classifyByRules({ subject: email.subject, bodyHead: text.slice(0, 1500), businessContact: email.businessContact });
-  return { outcome, snippet: email.snippet };
+  const verdict = classifyByRules({ subject: email.subject, bodyHead: head, businessContact: email.businessContact });
+  // Partnership is the catch-all: when the rules can't decide, the item lands there (and can be
+  // moved to Complaints with one click). `confident` says whether the rules actually decided.
+  if (verdict === 'unsorted') return { outcome: 'partnership', snippet: email.snippet, confident: false };
+  return { outcome: verdict, snippet: email.snippet, confident: true };
 }

@@ -4,7 +4,7 @@ import { Archive, Inbox, LogOut, RefreshCw } from 'lucide-react';
 import { api } from '../api.js';
 import { SECTIONS, STATUS_LABELS } from '../sections.js';
 import ItemCard from './ItemCard.jsx';
-import EscalateModal from './EscalateModal.jsx';
+import NotifyModal from './NotifyModal.jsx';
 
 export default function Dashboard({ session, sectionKey, onSignOut }) {
   const section = SECTIONS[sectionKey];
@@ -16,7 +16,7 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
   const [filter, setFilter] = useState('all');
   const [showArchived, setShowArchived] = useState(false);
   const [archivedCount, setArchivedCount] = useState(0);
-  const [escalating, setEscalating] = useState(null);
+  const [notifying, setNotifying] = useState(null);
   const [toast, setToast] = useState(null);
   const [syncing, setSyncing] = useState(false);
 
@@ -24,8 +24,6 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
     setToast({ message, tone });
     setTimeout(() => setToast(null), 4000);
   }, []);
-
-  const canArchive = isAdmin && !section.adminOnly;
 
   const load = useCallback(async () => {
     setError('');
@@ -55,9 +53,9 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
 
   async function changeStatus(item, status) {
     if (status === item.status) return;
-    // For admins, "escalated" always means picking who it goes to.
-    if (isAdmin && status === 'escalated_to_team') {
-      setEscalating(item);
+    // For admins, "notified" always means picking who to notify, so it opens the Notify form.
+    if (isAdmin && status === 'notified') {
+      setNotifying(item);
       return;
     }
     const previous = item.status;
@@ -70,12 +68,13 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
     }
   }
 
-  async function sortItem(item, category) {
+  async function moveItem(item, category) {
     const previous = items;
     setItems((current) => current.filter((i) => i.id !== item.id));
     try {
       await api.setCategory(item.id, category);
-      showToast(`Moved to ${category === 'partnership' ? 'Partnership' : 'Complaints / Enquiries'}`);    } catch (err) {
+      showToast(`Moved to ${category === 'partnership' ? 'Partnership' : 'Complaints / Enquiries'}`);
+    } catch (err) {
       setItems(previous);
       showToast(err.message, 'error');
     }
@@ -175,11 +174,10 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
         <div className="page-head">
           <h1>{singleItem ? 'Item for your review' : showArchived ? `Archived · ${section.label}` : section.label}</h1>
           {singleItem && <p className="muted">You were sent this item. Update its status below when you've dealt with it.</p>}
-          {section.description && <p className="muted">{section.description}</p>}
           {showArchived && <p className="muted">Archived items are hidden from the active list. Restore one to bring it back.</p>}
         </div>
 
-        {!singleItem && !section.adminOnly && (
+        {!singleItem && (
           <div className="filters" role="group" aria-label="Filter by status">
             {!showArchived &&
               items &&
@@ -194,7 +192,7 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
                   {status === 'all' ? 'All' : STATUS_LABELS[status]} <span className="chip-count">{counts[status]}</span>
                 </button>
               ))}
-            {canArchive && (
+            {isAdmin && (
               <button
                 className={`chip chip--archive${showArchived ? ' chip--active' : ''}`}
                 onClick={() => setShowArchived((value) => !value)}
@@ -238,13 +236,12 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
                 key={item.id}
                 item={item}
                 statuses={section.statuses}
-                canEscalate={isAdmin && !showArchived}
+                canNotify={isAdmin && !showArchived}
                 onStatusChange={changeStatus}
-                onEscalate={setEscalating}
-                onSort={section.adminOnly ? sortItem : undefined}
-                onDelete={section.adminOnly ? deleteItem : undefined}
-                onMove={canArchive && !showArchived ? sortItem : undefined}
-                onArchive={canArchive ? archiveItem : undefined}
+                onNotify={setNotifying}
+                onDelete={isAdmin && section.category === 'partnership' ? deleteItem : undefined}
+                onMove={isAdmin && !showArchived ? moveItem : undefined}
+                onArchive={isAdmin ? archiveItem : undefined}
                 archived={showArchived}
               />
             ))}
@@ -252,11 +249,12 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
         )}
       </main>
 
-      {escalating && (
-        <EscalateModal
-          item={escalating}
-          onClose={() => setEscalating(null)}
-          onEscalated={(updated) => patchItem(updated.id, updated)}
+      {notifying && (
+        <NotifyModal
+          item={notifying}
+          adminName={session.name}
+          onClose={() => setNotifying(null)}
+          onNotified={(updated) => patchItem(updated.id, updated)}
         />
       )}
 

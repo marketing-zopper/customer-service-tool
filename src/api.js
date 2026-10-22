@@ -38,7 +38,7 @@ async function attempt(path, { method = 'GET', body } = {}) {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Reads are safe to repeat, so a brief outage is retried instead of shown to the user.
-// Writes (status changes, escalations, deletes) are never retried automatically.
+// Writes (status changes, notifications, deletes) are never retried automatically.
 async function request(path, options = {}) {
   const isRead = !options.method || options.method === 'GET';
   for (let tries = 0; ; tries += 1) {
@@ -63,6 +63,6 @@ export const api = {
   setStatus: (id, status) => request(`/items/${id}/status`, { method: 'PATCH', body: { status } }),
   deleteItem: (id) => request(`/items/${id}`, { method: 'DELETE' }),
   setCategory: (id, category) => request(`/items/${id}/category`, { method: 'PATCH', body: { category } }),
-  escalate: (itemId, email, note) => request('/escalate', { method: 'POST', body: { itemId, email, note } }),
+  notify: (itemId, email, ccEmail, note) => request('/escalate', { method: 'POST', body: { itemId, email, ccEmail, note } }),
   sync: () => request('/ingest', { method: 'POST' }),
 };

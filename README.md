@@ -1,11 +1,11 @@
 # Zopper Service Triage
 
-Internal dashboard that pulls the website's contact-form submissions from Webflow (read-only), sorts them into **Partnership** or **Complaints / Enquiries**, and lets the marketing team escalate any item to the concerned person through a one-item magic link. There are no user accounts. Access is either the shared marketing password or a magic link.
+Internal dashboard that pulls the website's contact-form submissions from Webflow (read-only), sorts them into **Partnership** or **Complaints / Enquiries**, and lets the marketing team notify the concerned person about any item by email, with the full details and a one-item magic link. There are no user accounts. Access is either the shared marketing password or a magic link.
 
 - **Frontend:** React (JS) + Vite SPA, Poppins, lucide-react
 - **Backend:** one Node router (`server/router.js`) served as a Vercel function (`api/index.js`) in production and by `server/dev.js` locally
 - **Data:** Supabase Postgres, reached only through the backend with the service-role key
-- **Classification:** keyword rules only (no AI service). Anything the rules can't place goes to an admin-only **Needs sorting** tab, where the team moves it to the right tab with one click.
+- **Classification:** keyword rules only (no AI service). Anything the rules can't place goes to **Partnership**, which is the catch-all; the team moves a wrong one to Complaints with one click.
 - **Email out:** Resend
 
 ## Run locally
@@ -13,7 +13,7 @@ Internal dashboard that pulls the website's contact-form submissions from Webflo
 ```bash
 npm install
 cp .env.example .env        # fill in the values, see below
-# run the files in supabase/migrations/ in order (0001 to 0004) in the Supabase SQL editor
+# run the files in supabase/migrations/ in order (0001 to 0005) in the Supabase SQL editor
 npm run dev                 # web on :5173, API on :8787 (Vite proxies /api)
 npm test                    # access-control + classifier tests (no network or keys needed)
 ```
@@ -29,7 +29,7 @@ Minimum to see the dashboard: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `ADMI
 | `SESSION_SECRET` | signing the admin cookie (32+ chars) | login fails with 500 |
 | `APP_URL` | magic links and the logo in emails | defaults to `http://localhost:5173` |
 | `MAGIC_LINK_TTL_DAYS` | link expiry | 7 |
-| `RESEND_API_KEY`, `MAIL_FROM` | sending escalation emails | the modal shows the link so it can be shared by hand |
+| `RESEND_API_KEY`, `MAIL_FROM` | sending notification emails | the modal shows the link so it can be shared by hand |
 | `WEBFLOW_API_TOKEN`, `WEBFLOW_SITE_ID` | pulling form submissions | "Sync" reports "not configured" and nothing is imported |
 | `WEBFLOW_FORMS`, `WEBFLOW_LOOKBACK_DAYS`, `WEBFLOW_MAX_PER_RUN` | which forms, how far back, batch size | the two lead forms, 90 days, 300 per run |
 | `CRON_SECRET` | scheduled `/api/ingest` | only an admin can trigger sync |
@@ -56,7 +56,7 @@ Import the repo, set the env vars above, deploy. `vercel.json` rewrites every no
 ## How access works
 
 - **Marketing team (5 people):** pick a name, enter the shared password. The server checks the name against `admin_names` and the password against `ADMIN_PASSWORD` (constant-time), then sets a signed, httpOnly, 30-day cookie carrying the name. That name is stored as `created_by` on any link they generate. Sessions can't be revoked individually, so rotate `SESSION_SECRET` to sign everyone out.
-- **Magic link:** `/dashboard/<section>?token=…`. The token is 256 bits of randomness. Only its SHA-256 is stored. The page sends it in an `x-magic-token` header so it stays out of API logs. The backend checks it on every request: the link only works for its category, and an item-scoped link only for that one item. Link holders can change status but can't escalate. An expired or unknown link shows the branded "access restricted" screen.
+- **Magic link:** `/dashboard/<section>?token=…`. The token is 256 bits of randomness. Only its SHA-256 is stored. The page sends it in an `x-magic-token` header so it stays out of API logs. The backend checks it on every request: the link only works for its category, and an item-scoped link only for that one item. Link holders can change status but can't notify, move, archive or delete. An expired or unknown link shows the branded "access restricted" screen.
 - **Everything else:** the sign-in screen.
 
 ## Defaults I chose for the open assumptions (change if wrong)
@@ -69,24 +69,28 @@ Import the repo, set the env vars above, deploy. `vercel.json` rewrites every no
 ## Deviations from the written spec
 
 - `mail_items.category` is **nullable**, but only for leads (a check constraint enforces this). Leads are stored with `is_lead = true` and appear on neither tab. There's no UI for them yet; query `mail_items where is_lead`.
-- Added a third category, **`unsorted`**, shown on an admin-only "Needs sorting" tab (magic links can never reach it). Items there can't be escalated until they're moved to Partnership or Complaints / Enquiries.
+- There is no "Needs sorting" tab. Items the rules can't place are filed under Partnership. (The database enum still has an unused `unsorted` value; migration 0005 moved all such items to Partnership.)
 - The `partnership_status` / `complaint_status` enums are replaced by one check constraint on `status` that allows the right values per category (and the API validates too).
 - `magic_links.token` is stored as **`token_hash`** (SHA-256) so a database leak doesn't expose live links.
 - Added `mail_items.source_id` and an `ingested_messages` table for de-duplication, including submissions that were ignored. (Column names still carry a `source` / `mail_` flavour from the earlier Gmail version.)
 - Added an `ignore` outcome in classification: auto-replies, bounces, no-reply senders and job seekers aren't stored.
-- Choosing "Escalated to team" in the dropdown opens the escalate dialog for marketing users, since escalation needs a recipient. Escalating a partnership records the recipient but leaves its status alone (there's no escalated state for partnerships).
+- Both tabs share one status set: **Active** (default), **In review**, **Notified**, **Resolved**. Pressing **Notify** (or choosing "Notified" in the dropdown, as a marketing user) opens the Notify form, sends the email and sets the status to Notified.
 
 ## How the rules classify
 
-All in `server/lib/classify.js`; edit the keyword lists there to tune it. Each side is scored: a keyword in the subject counts 3, in the first 1,500 characters of the message counts 1 (capped at 6 hits). Clear complaint words ("refund", "not working"…) count fully; everyday service/insurance words ("claims", "policy", "service"…) count half because partnership pitches use them too. A side wins only with enough points (3, or 0.5 for a message under 300 characters) **and** at least twice the other side's score. Otherwise the item goes to Needs sorting. A **lead** is purchase wording (quote, pricing, premium, group insurance, purchase…) with no partnership or complaint wording at all. Leads are hidden from both tabs, so if real messages are landing there, tighten `LEAD_RE`.
+All in `server/lib/classify.js`; edit the keyword lists there to tune it. Each side is scored: a keyword in the subject counts 3, in the first 1,500 characters of the message counts 1 (capped at 6 hits). Clear complaint words ("refund", "not working"…) count fully; everyday service/insurance words ("claims", "policy", "service"…) count half because partnership pitches use them too. A side wins only with enough points (3, or 0.5 for a message under 300 characters) **and** at least twice the other side's score. Otherwise the item is filed under Partnership. A **lead** is purchase wording (quote, pricing, premium, group insurance, purchase…) with no partnership or complaint wording at all. Leads are hidden from both tabs, so if real messages are landing there, tighten `LEAD_RE`.
 
-**Web-form senders with an executive title** (founder, CEO, director, VP, head, MD, partner…) at a named organisation, and no complaint wording, get a boost toward Partnership, so a one-line "Interested in the product" from a bank VP isn't lost in Needs sorting. Everyday titles like "Manager" or "Owner" don't count (individual customers type them too), and junk like "NA" never does. This tie-breaker never applies to purchase/quote requests (those stay leads) or complaints.
+**Web-form senders with an executive title** (founder, CEO, director, VP, head, MD, partner…) at a named organisation, and no complaint wording, get a boost toward Partnership, so a one-line "Interested in the product" from a bank VP isn't left as an unsure guess. Everyday titles like "Manager" or "Owner" don't count (individual customers type them too), and junk like "NA" never does. This tie-breaker never applies to purchase/quote requests (those stay leads) or complaints.
 
 **Job seekers and students** (internship, resume, vacancies, "work in your company", "join your company", wanting to become a POSP/agent/retailer, notice period…) are dropped entirely: never stored, shown on no tab, and recorded as "ignore" so they aren't re-imported. A message is only dropped if it has no strong complaint wording and fewer than two partnership terms, so a customer or business that happens to use one of those words still reaches the team. The list is `JOB_SEEKER_RE` in `server/lib/classify.js`.
 
-**Archive / delete.** Admins can **Archive** an item on the Partnership and Complaints tabs: it leaves the active list (and its status is untouched) and appears under the tab's **Archived** toggle, where **Restore** brings it back. A magic link sent for one specific item still opens it after archiving. **Delete** exists only on Needs sorting, is permanent, and the sync remembers the item so it isn't re-imported.
+**Archive / delete.** Admins can **Archive** an item on the Partnership and Complaints tabs: it leaves the active list (and its status is untouched) and appears under the tab's **Archived** toggle, where **Restore** brings it back. A magic link sent for one specific item still opens it after archiving. **Delete** exists only on Partnership (where anything unplaced lands), is permanent, and the sync remembers the item so it isn't re-imported. Complaints can be archived but not deleted.
 
-Admins can correct any wrong guess with **Move to Partnership / Complaints** on a card. Moving an item resets its status to "In review".
+Admins can correct any wrong guess with **Move to Partnership / Complaints** on a card. Moving an item resets its status to "Active".
+
+## Notification emails
+
+**Notify** emails the concerned person everything needed to act without opening the dashboard: the sender's name, email, phone, organisation and designation, when it was received (IST), which form it came from, the **complete message**, an optional note, and the one-item link. The form asks the marketing employee for **their own email (required)**: it is copied on the email and set as Reply-To, because the email itself is sent from the shared `MAIL_FROM` address. The address is remembered in that browser. If the email can't be sent, the item still becomes Notified but its card shows a red "Email … was not sent" warning, and the form shows the link to share by hand.
 
 ## Layout
 
