@@ -14,7 +14,7 @@ const initialsOf = (name) =>
     .toUpperCase();
 
 /** The dark, translucent left rail: brand, the two sections, and who is signed in. */
-export default function Sidebar({ session, isAdmin, onSignOut, expires }) {
+export default function Sidebar({ session, isAdmin, onSignOut, expires, children }) {
   return (
     <aside className="sidebar">
       <div className="sidebar-brand">
@@ -38,6 +38,8 @@ export default function Sidebar({ session, isAdmin, onSignOut, expires }) {
           })}
         </nav>
       )}
+
+      {children && <div className="sidebar-extra">{children}</div>}
 
       <div className="sidebar-spacer" />
 

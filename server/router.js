@@ -17,8 +17,10 @@ import { runIngest } from './lib/ingest.js';
 import { searchFilters } from './lib/search.js';
 
 const LIST_COLUMNS =
-  'id,category,status,subject,sender_email,sender_name,body_snippet,received_at,assigned_to,assigned_email_status,archived_at,updated_at';
+  'id,category,status,subject,sender_email,sender_name,body_snippet,received_at,assigned_to,assigned_email_status,archived_at,comment_count,updated_at';
 const DETAIL_COLUMNS = `${LIST_COLUMNS},body_full`;
+const COMMENT_COLUMNS = 'id,author,author_role,body,status_set,created_at';
+const COMMENT_MAX = 2000;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
 async function getItem(id, columns = LIST_COLUMNS) {
@@ -126,7 +128,44 @@ const handlers = {
   async getItem({ auth, params }) {
     const item = await getItem(params.id, DETAIL_COLUMNS);
     requireItemScope(auth, item.category, item.id);
-    return { item: stripInternal(item) };
+    const comments = unwrap(
+      await db().from('item_comments').select(COMMENT_COLUMNS).eq('mail_item_id', item.id).order('created_at', { ascending: true }),
+    );
+    return { item: stripInternal(item), comments };
+  },
+
+  // The reply from whoever a query was escalated to: a new status, a comment, or both in one go, so
+  // the comment is stored together with the status update. Allowed on exactly the items the caller
+  // can already see (a shared link: its one item).
+  async respond({ req, auth, params }) {
+    const { status, comment } = await readJson(req);
+    const item = await getItem(params.id);
+    requireItemScope(auth, item.category, item.id);
+
+    const text = String(comment ?? '').trim();
+    if (text.length > COMMENT_MAX) throw new HttpError(400, `Comments can be up to ${COMMENT_MAX} characters`);
+    if (status && !STATUSES[item.category].includes(status)) throw new HttpError(400, `Invalid status for ${item.category}`);
+    const statusChanged = Boolean(status) && status !== item.status;
+    if (!statusChanged && !text) throw new HttpError(400, 'Write a comment or choose a new status');
+
+    const saved = unwrap(
+      await db()
+        .from('item_comments')
+        .insert({
+          mail_item_id: item.id,
+          author: auth.kind === 'admin' ? auth.name : auth.link.recipient_email || 'Responder',
+          author_role: auth.kind === 'admin' ? 'team' : 'responder',
+          body: text || null,
+          status_set: statusChanged ? status : null,
+        })
+        .select(COMMENT_COLUMNS)
+        .single(),
+    );
+
+    const changes = { comment_count: (item.comment_count ?? 0) + (text ? 1 : 0) };
+    if (statusChanged) changes.status = status;
+    const updated = unwrap(await db().from('mail_items').update(changes).eq('id', item.id).select(LIST_COLUMNS).single());
+    return { item: updated, comment: saved };
   },
 
   async updateStatus({ req, auth, params }) {
@@ -246,6 +285,7 @@ const routes = [
   ['DELETE', /^\/api\/items\/(?<id>[0-9a-f-]{36})$/, handlers.deleteItem],
   ['PATCH', /^\/api\/items\/(?<id>[0-9a-f-]{36})\/archive$/, handlers.setArchived],
   ['PATCH', /^\/api\/items\/(?<id>[0-9a-f-]{36})\/status$/, handlers.updateStatus],
+  ['POST', /^\/api\/items\/(?<id>[0-9a-f-]{36})\/respond$/, handlers.respond],
   ['PATCH', /^\/api\/items\/(?<id>[0-9a-f-]{36})\/category$/, handlers.setCategory],
   ['POST', /^\/api\/escalate$/, handlers.escalate],
   ['POST', /^\/api\/ingest$/, handlers.ingest],

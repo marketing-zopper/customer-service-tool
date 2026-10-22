@@ -61,6 +61,7 @@ export const api = {
     request(`/items?category=${category}${archived ? '&archived=1' : ''}${query ? `&q=${encodeURIComponent(query)}` : ''}`),
   setArchived: (id, archived) => request(`/items/${id}/archive`, { method: 'PATCH', body: { archived } }),
   getItem: (id) => request(`/items/${id}`),
+  respond: (id, status, comment) => request(`/items/${id}/respond`, { method: 'POST', body: { status, comment } }),
   setStatus: (id, status) => request(`/items/${id}/status`, { method: 'PATCH', body: { status } }),
   deleteItem: (id) => request(`/items/${id}`, { method: 'DELETE' }),
   setCategory: (id, category) => request(`/items/${id}/category`, { method: 'PATCH', body: { category } }),

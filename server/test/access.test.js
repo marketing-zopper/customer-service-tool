@@ -25,7 +25,7 @@ const tables = {};
 const sentEmails = [];
 function resetDb() {
   const item = (id, category, extra = {}) => ({
-    id, category, status: 'active', subject: `Subject ${id.slice(0, 2)}`, sender_email: 's@x.com',
+    id, comment_count: 0, category, status: 'active', subject: `Subject ${id.slice(0, 2)}`, sender_email: 's@x.com',
     sender_name: 'Sender', body_snippet: 'snippet', body_full: 'full body', received_at: '2026-01-01T00:00:00Z',
     assigned_to: null, updated_at: '2026-01-01T00:00:00Z', is_lead: false, ...extra,
   });
@@ -34,8 +34,9 @@ function resetDb() {
     item(ITEM_P, 'partnership'), item(ITEM_C, 'complaint_enquiry'), item(ITEM_C2, 'complaint_enquiry'),
     item(ITEM_LEAD, null, { is_lead: true }),
   ];
+  tables.item_comments = [];
   tables.magic_links = [
-    { token_hash: hashToken('item-link-token-for-complaint-1'), scope: 'complaint_enquiry', mail_item_id: ITEM_C, expires_at: inFuture },
+    { token_hash: hashToken('item-link-token-for-complaint-1'), scope: 'complaint_enquiry', mail_item_id: ITEM_C, recipient_email: 'boss@zopper.com', expires_at: inFuture },
     { token_hash: hashToken('section-link-token-partnership'), scope: 'partnership', mail_item_id: null, expires_at: inFuture },
     { token_hash: hashToken('expired-link-token-complaint-xx'), scope: 'complaint_enquiry', mail_item_id: ITEM_C, expires_at: inPast },
   ];
@@ -77,9 +78,15 @@ function fakeSupabase(url, init) {
 
   let result = [];
   if (method === 'POST') {
-    const body = JSON.parse(init.body);
-    rows.push(...(Array.isArray(body) ? body : [body]));
-    return new Response(null, { status: 201 });
+    const incoming = [].concat(JSON.parse(init.body)).map((row) => ({
+      id: `00000000-0000-4000-8000-${String(rows.length + 1).padStart(12, '0')}`,
+      created_at: new Date(Date.now() + rows.length).toISOString(),
+      ...row,
+    }));
+    rows.push(...incoming);
+    const prefer = init.headers?.get ? init.headers.get('Prefer') : init.headers?.Prefer;
+    if (!String(prefer || '').includes('return=representation')) return new Response(null, { status: 201 });
+    return new Response(JSON.stringify(wantsObject ? incoming[0] : incoming), { status: 201, headers: { 'content-type': 'application/json' } });
   }
   if (method === 'DELETE') {
     tables[table] = rows.filter((row) => !matches(row));
@@ -417,6 +424,67 @@ test('search cannot reveal items outside what the caller may see', async () => {
   assert.ok(!all.data.items.some((i) => i.id === ITEM_LEAD));
   // anonymous callers get nothing
   assert.equal((await call(`/api/items?category=partnership${q}`)).status, 401);
+});
+
+test('respond: the person a query was escalated to saves a status and a comment together', async () => {
+  resetDb();
+  const link = 'item-link-token-for-complaint-1'; // sent to boss@zopper.com for exactly one complaint
+  const respond = (id, body, opts = {}) => call(`/api/items/${id}/respond`, { method: 'POST', body, ...opts });
+
+  // who may respond
+  assert.equal((await respond(ITEM_C, { comment: 'hi' })).status, 401); // anonymous
+  assert.equal((await respond(ITEM_C2, { comment: 'hi' }, { token: link })).status, 403); // another item
+  assert.equal((await respond(ITEM_P, { comment: 'hi' }, { token: link })).status, 403); // another tab
+  assert.equal(tables.item_comments.length, 0);
+
+  // what is refused
+  assert.equal((await respond(ITEM_C, {}, { token: link })).status, 400); // nothing to save
+  assert.equal((await respond(ITEM_C, { comment: '   ' }, { token: link })).status, 400); // blank
+  assert.equal((await respond(ITEM_C, { status: 'active' }, { token: link })).status, 400); // same status, no comment
+  assert.equal((await respond(ITEM_C, { status: 'accepted', comment: 'x' }, { token: link })).status, 400); // old status
+  assert.equal((await respond(ITEM_C, { comment: 'x'.repeat(2001) }, { token: link })).status, 400); // too long
+  assert.equal(tables.item_comments.length, 0);
+
+  // status + comment in one go
+  const both = await respond(ITEM_C, { status: 'resolved', comment: '  Refund issued today.  ' }, { token: link });
+  assert.equal(both.status, 200);
+  assert.equal(both.data.item.status, 'resolved');
+  assert.equal(both.data.item.comment_count, 1);
+  assert.equal(both.data.comment.author, 'boss@zopper.com');
+  assert.equal(both.data.comment.author_role, 'responder');
+  assert.equal(both.data.comment.body, 'Refund issued today.'); // trimmed
+  assert.equal(both.data.comment.status_set, 'resolved');
+
+  // comment alone leaves the status; status alone adds an entry but no comment
+  const commentOnly = await respond(ITEM_C, { comment: 'Customer confirmed.' }, { token: link });
+  assert.equal(commentOnly.data.item.status, 'resolved');
+  assert.equal(commentOnly.data.item.comment_count, 2);
+  assert.equal(commentOnly.data.comment.status_set, null);
+  const statusOnly = await respond(ITEM_C, { status: 'in_review' }, { token: link });
+  assert.equal(statusOnly.data.item.status, 'in_review');
+  assert.equal(statusOnly.data.item.comment_count, 2); // only written comments are counted
+  assert.equal(statusOnly.data.comment.body, null);
+
+  // it is all stored in order, shown with the item, and counted on the list
+  const detail = await call(`/api/items/${ITEM_C}`, { token: link });
+  assert.deepEqual(detail.data.comments.map((c) => [c.body, c.status_set]), [
+    ['Refund issued today.', 'resolved'],
+    ['Customer confirmed.', null],
+    [null, 'in_review'],
+  ]);
+  const list = await call('/api/items?category=complaint_enquiry', { token: link });
+  assert.equal(list.data.items[0].comment_count, 2);
+
+  // the marketing team sees the same thread, and can add to it under their own name
+  const cookie = await adminCookie();
+  assert.equal((await call(`/api/items/${ITEM_C}`, { cookie })).data.comments.length, 3);
+  const team = await respond(ITEM_C, { comment: 'Thanks, closing this.' }, { cookie });
+  assert.deepEqual([team.data.comment.author, team.data.comment.author_role], ['Arpit Jain', 'team']);
+
+  // an item nobody has commented on has an empty thread, and markup is stored as plain text
+  assert.deepEqual((await call(`/api/items/${ITEM_C2}`, { cookie })).data.comments, []);
+  const raw = await respond(ITEM_C2, { comment: '<script>alert(1)</script>' }, { cookie });
+  assert.equal(raw.data.comment.body, '<script>alert(1)</script>');
 });
 
 test('delete: admin-only, Partnership items only, and the sync remembers it', async () => {

@@ -86,7 +86,7 @@ export function renderNotificationEmail({ item, url, notifiedBy, notifiedByEmail
           <p style="margin:0 0 6px;font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:#6B7280;">Message</p>
           <div style="margin:0 0 24px;font-size:14px;line-height:1.65;color:#111827;white-space:pre-wrap;overflow-wrap:anywhere;border-left:3px solid #19B4EA;background:#F6F7FA;border-radius:0 8px 8px 0;padding:14px 16px;">${escapeHtml(message || '(no message text)')}</div>
           <a href="${url}" style="display:inline-block;background:#EE773D;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;padding:12px 24px;border-radius:8px;">Review this item</a>
-          <p style="margin:24px 0 0;font-size:12px;line-height:1.6;color:#6B7280;">This link opens only this item and lets you update its status. Please don't forward it.${expiry ? ` It expires on ${escapeHtml(expiry)}.` : ''} Reply to this email to reach ${escapeHtml(notifiedBy)}.</p>
+          <p style="margin:24px 0 0;font-size:12px;line-height:1.6;color:#6B7280;">This link opens only this item and lets you set its status and leave a comment for the team. Please don't forward it.${expiry ? ` It expires on ${escapeHtml(expiry)}.` : ''} Reply to this email to reach ${escapeHtml(notifiedBy)}.</p>
         </td></tr>
       </table>
     </td></tr>

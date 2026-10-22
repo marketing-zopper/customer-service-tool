@@ -6,12 +6,15 @@ import { isStale, lastSyncAt, markSynced } from '../autoSync.js';
 import ItemRow from './ItemRow.jsx';
 import NotifyModal from './NotifyModal.jsx';
 import SearchBox from './SearchBox.jsx';
+import ResponsePanel from './ResponsePanel.jsx';
 import Sidebar from './Sidebar.jsx';
+import { useMediaQuery } from '../useMediaQuery.js';
 
 export default function Dashboard({ session, sectionKey, onSignOut }) {
   const section = SECTIONS[sectionKey];
   const isAdmin = session.role === 'admin';
   const singleItem = session.role === 'link' && session.itemId;
+  const wide = useMediaQuery('(min-width: 900px)'); // wide enough for the sidebar to be a side panel
 
   const [items, setItems] = useState(null);
   const [error, setError] = useState('');
@@ -189,16 +192,25 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
   const pending = resultsFor !== searchTerm; // a newer search is on its way; the list on screen is stale
   const title = singleItem ? 'Item for your review' : showArchived ? `Archived · ${section.label}` : section.label;
   const subtitle = singleItem
-    ? "You were sent this item. Update its status below when you've dealt with it."
+    ? 'You were sent this item. Use “Your response” to set its status and leave a comment for the team.'
     : showArchived
       ? 'Archived items are hidden from the active list. Restore one to bring it back.'
       : items && !searchTerm
         ? `${items.length} ${items.length === 1 ? 'item' : 'items'}`
         : '';
 
+  // The person a query was escalated to replies from this panel: in the sidebar's empty space on wide
+  // screens, under the item on narrow ones.
+  const responseItem = singleItem ? items?.[0] : null;
+  const responsePanel = responseItem ? (
+    <ResponsePanel item={responseItem} statuses={section.statuses} onSaved={(updated) => patchItem(updated.id, updated)} tone={wide ? 'dark' : 'light'} />
+  ) : null;
+
   return (
     <div className="shell">
-      <Sidebar session={session} isAdmin={isAdmin} onSignOut={onSignOut} expires={expires} />
+      <Sidebar session={session} isAdmin={isAdmin} onSignOut={onSignOut} expires={expires}>
+        {wide ? responsePanel : null}
+      </Sidebar>
 
       <main className="main">
         <header className="main-head">
@@ -327,11 +339,14 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
                   onMove={isAdmin && !showArchived ? moveItem : undefined}
                   onArchive={isAdmin ? archiveItem : undefined}
                   archived={showArchived}
+                  readOnlyStatus={Boolean(singleItem)}
                 />
               ))}
             </div>
           )}
         </div>
+
+        {!wide && responsePanel && <div className="main-response">{responsePanel}</div>}
       </main>
 
       {notifying && (
