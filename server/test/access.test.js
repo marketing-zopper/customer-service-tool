@@ -41,13 +41,33 @@ function resetDb() {
   ];
 }
 
+// LIKE pattern (with backslash escapes) -> case-insensitive regex
+const likeToRegex = (pattern) => {
+  let out = '';
+  for (let i = 0; i < pattern.length; i += 1) {
+    const ch = pattern[i];
+    if (ch === '\\') out += pattern[++i].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    else if (ch === '%') out += '.*';
+    else if (ch === '_') out += '.';
+    else out += ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp('^' + out + '$', 'is');
+};
+// one or=(...) parameter -> does the row match any of its ilike terms?
+const matchesOr = (row, param) =>
+  [...param.matchAll(/(\w+)\.ilike\."((?:[^"\\]|\\.)*)"/g)].some(([, column, quoted]) =>
+    likeToRegex(quoted.replace(/\\(.)/g, '$1')).test(String(row[column] ?? '')),
+  );
+
 function fakeSupabase(url, init) {
   const u = new URL(url);
   const table = u.pathname.split('/').pop();
   const method = init?.method || 'GET';
   const wantsObject = String(init?.headers?.Accept || init?.headers?.get?.('Accept') || '').includes('vnd.pgrst.object');
   const filters = [...u.searchParams].filter(([, v]) => v.startsWith('eq.') || v === 'is.null' || v === 'not.is.null');
+  const ors = u.searchParams.getAll('or');
   const matches = (row) =>
+    ors.every((param) => matchesOr(row, param)) &&
     filters.every(([k, v]) => {
       if (v === 'is.null') return row[k] == null;
       if (v === 'not.is.null') return row[k] != null;
@@ -334,6 +354,69 @@ test('archive: admin-only, hides from the active list, restorable, never loses t
   assert.deepEqual(await ids('&archived=1', { cookie }), []);
 
   assert.equal((await archive(ITEM_LEAD, true, { cookie })).status, 404); // leads aren't reachable
+});
+
+test('search: finds items by name, email, phone, organisation or message; every word must match', async () => {
+  resetDb();
+  const add = (id, extra) => tables.mail_items.push({ ...tables.mail_items[0], id, category: 'partnership', ...extra });
+  const A = 'aaaaaaaa-0000-0000-0000-00000000000a';
+  const B = 'bbbbbbbb-0000-0000-0000-00000000000b';
+  const C = 'cccccccc-0000-0000-0000-00000000000c';
+  add(A, { subject: 'Contact form – Acme Pvt Ltd', sender_name: 'Asha Rao', sender_email: 'asha@acme.com', body_full: 'We want a tie-up.\n\nOrganisation: Acme Pvt Ltd\nDesignation: Founder\nPhone: 9890152369' });
+  add(B, { subject: 'Contact form – Birla', sender_name: 'Bimal Das', sender_email: 'bimal@birla.in', body_full: 'Claim of 100% refund please, thanks (urgent), "now"\n\nPhone: 8000011111' });
+  add(C, { subject: 'Contact form – Acme Traders', sender_name: 'Chitra', sender_email: 'c@traders.in', body_full: 'Hello' });
+  const cookie = await adminCookie();
+  const find = async (q, query = '') => {
+    const r = await call(`/api/items?category=partnership${query}&q=${encodeURIComponent(q)}`, { cookie });
+    assert.equal(r.status, 200, q);
+    return r.data.items.map((i) => i.id).sort();
+  };
+
+  assert.deepEqual(await find('asha'), [A]); // sender name
+  assert.deepEqual(await find('BIRLA.IN'), [B]); // email, any case
+  assert.deepEqual(await find('9890152369'), [A]); // phone number, found in the full message
+  assert.deepEqual(await find('founder'), [A]); // designation
+  assert.deepEqual(await find('acme'), [A, C].sort()); // subject / organisation
+  assert.deepEqual(await find('acme founder'), [A]); // every word must match
+  assert.deepEqual(await find('  acme    founder  '), [A]); // spacing is ignored
+  assert.deepEqual(await find('acme birla'), []); // no single item has both
+  assert.deepEqual(await find('nothing like this'), []);
+  assert.equal((await find('')).length, 4); // empty search = everything (3 added + the original partnership item)
+
+  // special characters are searched literally and never break the query
+  assert.deepEqual(await find('100%'), [B]); // not a wildcard: "100" must be followed by a percent sign
+  assert.deepEqual(await find('10_%'), []); // underscore is not "any character"
+  assert.deepEqual(await find('(urgent),'), [B]);
+  assert.deepEqual(await find('"now"'), [B]);
+  assert.deepEqual(await find('x,y)or(id.gt.0'), []);
+
+  // search respects the archive view
+  await call(`/api/items/${B}/archive`, { method: 'PATCH', body: { archived: true }, cookie });
+  assert.deepEqual(await find('birla'), []);
+  assert.deepEqual(await find('birla', '&archived=1'), [B]);
+});
+
+test('search cannot reveal items outside what the caller may see', async () => {
+  resetDb();
+  const cookie = await adminCookie();
+  tables.mail_items.find((i) => i.id === ITEM_C).body_full = 'secret-phrase-complaint';
+  tables.mail_items.find((i) => i.id === ITEM_C2).body_full = 'secret-phrase-complaint too';
+  tables.mail_items.find((i) => i.id === ITEM_P).body_full = 'secret-phrase-complaint partnership';
+  const linkToken = 'item-link-token-for-complaint-1'; // sent for exactly one complaint
+  const q = '&q=secret-phrase';
+
+  // a link for one item only ever finds that item, whatever it searches for
+  const own = await call(`/api/items?category=complaint_enquiry${q}`, { token: linkToken });
+  assert.deepEqual(own.data.items.map((i) => i.id), [ITEM_C]);
+  // and can't search another category or the archive
+  assert.equal((await call(`/api/items?category=partnership${q}`, { token: linkToken })).status, 403);
+  assert.equal((await call(`/api/items?category=complaint_enquiry&archived=1${q}`, { token: linkToken })).status, 403);
+  // leads never show up in a search
+  tables.mail_items.find((i) => i.id === ITEM_LEAD).body_full = 'secret-phrase lead';
+  const all = await call(`/api/items?category=partnership${q}`, { cookie });
+  assert.ok(!all.data.items.some((i) => i.id === ITEM_LEAD));
+  // anonymous callers get nothing
+  assert.equal((await call(`/api/items?category=partnership${q}`)).status, 401);
 });
 
 test('delete: admin-only, Partnership items only, and the sync remembers it', async () => {

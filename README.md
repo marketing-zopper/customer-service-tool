@@ -88,6 +88,10 @@ All in `server/lib/classify.js`; edit the keyword lists there to tune it. Each s
 
 Admins can correct any wrong guess with **Move to Partnership / Complaints** on a card. Moving an item resets its status to "Active".
 
+## Search
+
+The frosted search box next to each tab's title searches that tab (active or archived, whichever you're viewing): the sender's name and email, the subject, and the full message, which for website forms also contains the phone number, organisation and designation. Every word you type must match somewhere ("acme founder" finds items mentioning both), case doesn't matter, and symbols like `%` or `_` are searched literally. Press `/` to jump to it and `Esc` to clear it. Your search stays when you switch tabs. The filtering happens in the database (`server/lib/search.js`) after the same access checks as the normal list, so a shared link can never find items outside its own.
+
 ## Notification emails
 
 **Notify** emails the concerned person everything needed to act without opening the dashboard: the sender's name, email, phone, organisation and designation, when it was received (IST), which form it came from, the **complete message**, an optional note, and the one-item link. The form asks the marketing employee for **their own email (required)**: it is copied on the email and set as Reply-To, because the email itself is sent from the shared `MAIL_FROM` address. The address is remembered in that browser. If the email can't be sent, the item still becomes Notified but its card shows a red "Email … was not sent" warning, and the form shows the link to share by hand.

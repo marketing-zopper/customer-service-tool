@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { NavLink } from 'react-router-dom';
 import { Archive, Inbox, LogOut, RefreshCw } from 'lucide-react';
 import { api } from '../api.js';
 import { SECTIONS, STATUS_LABELS } from '../sections.js';
 import ItemCard from './ItemCard.jsx';
 import NotifyModal from './NotifyModal.jsx';
+import SearchBox from './SearchBox.jsx';
 
 export default function Dashboard({ session, sectionKey, onSignOut }) {
   const section = SECTIONS[sectionKey];
@@ -19,32 +20,49 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
   const [notifying, setNotifying] = useState(null);
   const [toast, setToast] = useState(null);
   const [syncing, setSyncing] = useState(false);
+  const [query, setQuery] = useState('');
+  const [searchTerm, setSearchTerm] = useState(''); // the query actually being searched (debounced)
+  const latestRequest = useRef(0);
 
   const showToast = useCallback((message, tone = 'info') => {
     setToast({ message, tone });
     setTimeout(() => setToast(null), 4000);
   }, []);
 
+  // Wait for a pause in typing before searching, so each keystroke isn't a request.
+  useEffect(() => {
+    const timer = setTimeout(() => setSearchTerm(query.trim()), 300);
+    return () => clearTimeout(timer);
+  }, [query]);
+
   const load = useCallback(async () => {
+    const request = ++latestRequest.current;
     setError('');
     try {
-      const data = await api.listItems(section.category, showArchived);
+      const data = await api.listItems(section.category, showArchived, searchTerm);
+      if (request !== latestRequest.current) return; // a newer search has already replaced this one
       setItems(data.items);
       if (data.archivedCount !== undefined) setArchivedCount(data.archivedCount);
     } catch (err) {
+      if (request !== latestRequest.current) return;
       setError(err.message);
       setItems([]);
     }
-  }, [section.category, showArchived]);
+  }, [section.category, showArchived, searchTerm]);
 
   // Switching tabs always goes back to the active list.
   useEffect(() => {
     setShowArchived(false);
   }, [section.category]);
 
+  // Changing tab or switching to/from the archive shows a loading state; refining a search does not,
+  // so the results update in place instead of flashing.
   useEffect(() => {
     setItems(null);
     setFilter('all');
+  }, [section.category, showArchived]);
+
+  useEffect(() => {
     load();
   }, [load]);
 
@@ -172,9 +190,24 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
 
       <main className="content">
         <div className="page-head">
-          <h1>{singleItem ? 'Item for your review' : showArchived ? `Archived · ${section.label}` : section.label}</h1>
+          <div className="page-head-row">
+            <h1>{singleItem ? 'Item for your review' : showArchived ? `Archived · ${section.label}` : section.label}</h1>
+            {!singleItem && (
+              <SearchBox
+                value={query}
+                onChange={setQuery}
+                placeholder="Search name, email, phone, message…"
+                label={`Search ${showArchived ? 'archived ' : ''}${section.tabLabel.toLowerCase()} by name, email, phone or message`}
+              />
+            )}
+          </div>
           {singleItem && <p className="muted">You were sent this item. Update its status below when you've dealt with it.</p>}
           {showArchived && <p className="muted">Archived items are hidden from the active list. Restore one to bring it back.</p>}
+          {searchTerm && items && (
+            <p className="muted search-meta" aria-live="polite">
+              {items.length} result{items.length === 1 ? '' : 's'} for “{searchTerm}”
+            </p>
+          )}
         </div>
 
         {!singleItem && (
@@ -224,9 +257,11 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
             <p>
               {items.length > 0
                 ? `Nothing marked "${STATUS_LABELS[filter]}".`
-                : showArchived
-                  ? 'Nothing archived yet.'
-                  : section.emptyText}
+                : searchTerm
+                  ? `No results for “${searchTerm}”. Try fewer words, or part of a name, email or phone number.`
+                  : showArchived
+                    ? 'Nothing archived yet.'
+                    : section.emptyText}
             </p>
           </div>
         ) : (

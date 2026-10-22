@@ -57,7 +57,8 @@ export const api = {
   adminNames: () => request('/admin-names'),
   login: (name, password) => request('/login', { method: 'POST', body: { name, password } }),
   logout: () => request('/logout', { method: 'POST' }),
-  listItems: (category, archived = false) => request(`/items?category=${category}${archived ? '&archived=1' : ''}`),
+  listItems: (category, archived = false, query = '') =>
+    request(`/items?category=${category}${archived ? '&archived=1' : ''}${query ? `&q=${encodeURIComponent(query)}` : ''}`),
   setArchived: (id, archived) => request(`/items/${id}/archive`, { method: 'PATCH', body: { archived } }),
   getItem: (id) => request(`/items/${id}`),
   setStatus: (id, status) => request(`/items/${id}/status`, { method: 'PATCH', body: { status } }),

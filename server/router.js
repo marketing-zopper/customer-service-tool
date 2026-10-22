@@ -15,6 +15,7 @@ import {
 } from './lib/auth.js';
 import { emailConfigured, magicLinkUrl, sendNotificationEmail } from './lib/mail.js';
 import { runIngest } from './lib/ingest.js';
+import { searchFilters } from './lib/search.js';
 
 const LIST_COLUMNS =
   'id,category,status,subject,sender_email,sender_name,body_snippet,received_at,assigned_to,assigned_email_status,archived_at,updated_at';
@@ -91,6 +92,8 @@ const handlers = {
     } else {
       query = archived ? query.not('archived_at', 'is', null) : query.is('archived_at', null);
     }
+    // Optional search box; every word must match (see lib/search.js).
+    for (const filter of searchFilters(url.searchParams.get('q'))) query = query.or(filter);
     const items = unwrap(await query);
 
     if (auth.kind !== 'admin') return { items };
