@@ -77,6 +77,25 @@ function fakeSupabase(url, init) {
   const rows = tables[table] || [];
 
   let result = [];
+  // the atomic reply function: add the comment and update the item together, return the comment
+  if (method === 'POST' && table === 'respond_to_item') {
+    const p = JSON.parse(init.body);
+    const item = tables.mail_items.find((i) => i.id === p.p_item);
+    const comment = {
+      id: `00000000-0000-4000-9000-${String((tables.item_comments || []).length + 1).padStart(12, '0')}`,
+      mail_item_id: p.p_item,
+      author: p.p_author,
+      author_role: p.p_role,
+      body: p.p_body,
+      status_set: p.p_status,
+      created_at: new Date(Date.now() + (tables.item_comments || []).length).toISOString(),
+    };
+    tables.item_comments.push(comment);
+    if (p.p_status) item.status = p.p_status;
+    if (p.p_body !== null) item.comment_count += 1;
+    return new Response(JSON.stringify(comment), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+
   if (method === 'POST') {
     const incoming = [].concat(JSON.parse(init.body)).map((row) => ({
       id: `00000000-0000-4000-8000-${String(rows.length + 1).padStart(12, '0')}`,

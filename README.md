@@ -13,7 +13,7 @@ Internal dashboard that pulls the website's contact-form submissions from Webflo
 ```bash
 npm install
 cp .env.example .env        # fill in the values, see below
-# run the files in supabase/migrations/ in order (0001 to 0006) in the Supabase SQL editor
+# run the files in supabase/migrations/ in order (0001 to 0007) in the Supabase SQL editor
 npm run dev                 # web on :5173, API on :8787 (Vite proxies /api)
 npm test                    # access-control + classifier tests (no network or keys needed)
 ```
@@ -93,7 +93,7 @@ The frosted search box next to each tab's title searches that tab (active or arc
 
 ## Replies from the person notified
 
-Someone who opens a notification link sees one item and a **"Your response"** panel (in the sidebar's empty space on wide screens, under the item on narrow ones) with a status dropdown and a comment box. One button saves both together (`POST /api/items/:id/respond`), so the team sees why the status changed. The choices are Active, In review and Resolved ("Notified" is only shown while it's the current status). The row itself shows the status as a plain pill for them, so there's a single place to change it.
+Someone who opens a notification link sees one item and a **"Your response"** panel (in the sidebar's empty space on wide screens, under the item on narrow ones) with a status dropdown and a comment box. One button saves both together (`POST /api/items/:id/respond`), so the team sees why the status changed, and saving is a single atomic database step (the `respond_to_item` function, migration 0007), so a comment can never be recorded without the status change it claims. The choices are Active, In review and Resolved ("Notified" is only shown while it's the current status). The row itself shows the status as a plain pill for them, so there's a single place to change it.
 
 Comments are stored in `item_comments` (migration 0006) with who wrote them (the link's recipient email, or a team member's name), their role, the status they set, and the time. A status-only update is recorded too, but only written comments are counted. The team sees a "N comments" badge on the row, and the full thread, oldest first, when they open the item. A comment is plain text (up to 2,000 characters). The same rules as everywhere apply: a link can only reach its own item, and nothing is shown to anyone who couldn't already see that item.
 

@@ -148,23 +148,18 @@ const handlers = {
     const statusChanged = Boolean(status) && status !== item.status;
     if (!statusChanged && !text) throw new HttpError(400, 'Write a comment or choose a new status');
 
+    // One atomic database step (see migration 0007): the comment, the status it set and the item's
+    // new status and comment count are saved together or not at all.
     const saved = unwrap(
-      await db()
-        .from('item_comments')
-        .insert({
-          mail_item_id: item.id,
-          author: auth.kind === 'admin' ? auth.name : auth.link.recipient_email || 'Responder',
-          author_role: auth.kind === 'admin' ? 'team' : 'responder',
-          body: text || null,
-          status_set: statusChanged ? status : null,
-        })
-        .select(COMMENT_COLUMNS)
-        .single(),
+      await db().rpc('respond_to_item', {
+        p_item: item.id,
+        p_author: auth.kind === 'admin' ? auth.name : auth.link.recipient_email || 'Responder',
+        p_role: auth.kind === 'admin' ? 'team' : 'responder',
+        p_body: text || null,
+        p_status: statusChanged ? status : null,
+      }),
     );
-
-    const changes = { comment_count: (item.comment_count ?? 0) + (text ? 1 : 0) };
-    if (statusChanged) changes.status = status;
-    const updated = unwrap(await db().from('mail_items').update(changes).eq('id', item.id).select(LIST_COLUMNS).single());
+    const updated = unwrap(await db().from('mail_items').select(LIST_COLUMNS).eq('id', item.id).single());
     return { item: updated, comment: saved };
   },
 
