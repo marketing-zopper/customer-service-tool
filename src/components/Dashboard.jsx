@@ -22,6 +22,7 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
   const [syncing, setSyncing] = useState(false);
   const [query, setQuery] = useState('');
   const [searchTerm, setSearchTerm] = useState(''); // the query actually being searched (debounced)
+  const [resultsFor, setResultsFor] = useState(''); // the query the list on screen answers
   const latestRequest = useRef(0);
 
   const showToast = useCallback((message, tone = 'info') => {
@@ -42,6 +43,7 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
       const data = await api.listItems(section.category, showArchived, searchTerm);
       if (request !== latestRequest.current) return; // a newer search has already replaced this one
       setItems(data.items);
+      setResultsFor(searchTerm);
       if (data.archivedCount !== undefined) setArchivedCount(data.archivedCount);
     } catch (err) {
       if (request !== latestRequest.current) return;
@@ -203,7 +205,8 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
           </div>
           {singleItem && <p className="muted">You were sent this item. Update its status below when you've dealt with it.</p>}
           {showArchived && <p className="muted">Archived items are hidden from the active list. Restore one to bring it back.</p>}
-          {searchTerm && items && (
+          {/* Only claim a count once the list on screen really is the answer to this search. */}
+          {searchTerm && items && resultsFor === searchTerm && (
             <p className="muted search-meta" aria-live="polite">
               {items.length} result{items.length === 1 ? '' : 's'} for “{searchTerm}”
             </p>
@@ -265,7 +268,7 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
             </p>
           </div>
         ) : (
-          <div className="list">
+          <div className={`list${resultsFor !== searchTerm ? ' list--pending' : ''}`} aria-busy={resultsFor !== searchTerm}>
             {visible.map((item) => (
               <ItemCard
                 key={item.id}

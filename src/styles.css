@@ -568,6 +568,15 @@ button {
   gap: 12px;
 }
 
+/* While a new search is on its way, the old list stays but dims, so it never reads as the answer. */
+.list {
+  transition: opacity 0.15s;
+}
+.list--pending {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
 .card {
   display: flex;
   gap: 20px;
