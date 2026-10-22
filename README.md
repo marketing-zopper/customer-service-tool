@@ -2,7 +2,7 @@
 
 Internal dashboard that pulls the website's contact-form submissions from Webflow (read-only), sorts them into **Partnership** or **Complaints / Enquiries**, and lets the marketing team notify the concerned person about any item by email, with the full details and a one-item magic link. There are no user accounts. Access is either the shared marketing password or a magic link.
 
-- **Frontend:** React (JS) + Vite SPA, Poppins, lucide-react
+- **Frontend:** React (JS) + Vite SPA, Poppins, lucide-react. CRM-style layout: a dark brand-blue translucent sidebar, a frosted-glass main panel with underlined status tabs and a search toolbar, and a data table (#, Sender, Query, Received, Status, Actions). On narrower screens each row becomes a compact card, and on phones the sidebar becomes a top bar.
 - **Backend:** one Node router (`server/router.js`) served as a Vercel function (`api/index.js`) in production and by `server/dev.js` locally
 - **Data:** Supabase Postgres, reached only through the backend with the service-role key
 - **Classification:** keyword rules only (no AI service). Anything the rules can't place goes to **Partnership**, which is the catch-all; the team moves a wrong one to Complaints with one click.
@@ -32,7 +32,6 @@ Minimum to see the dashboard: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `ADMI
 | `RESEND_API_KEY`, `MAIL_FROM` | sending notification emails | the modal shows the link so it can be shared by hand |
 | `WEBFLOW_API_TOKEN`, `WEBFLOW_SITE_ID` | pulling form submissions | "Sync" reports "not configured" and nothing is imported |
 | `WEBFLOW_FORMS`, `WEBFLOW_LOOKBACK_DAYS`, `WEBFLOW_MAX_PER_RUN` | which forms, how far back, batch size | the two lead forms, 90 days, 300 per run |
-| `CRON_SECRET` | scheduled `/api/ingest` | only an admin can trigger sync |
 
 `MAIL_FROM` must use a domain verified in Resend. Until then Resend only delivers to your own account's address.
 
@@ -42,7 +41,7 @@ The two website forms **"Lead Generation (Contact Page)"** and **"Lead Generatio
 
 - **Read-only.** `server/lib/webflow.js` is the only code that talks to Webflow and it only sends `GET` requests. Nothing is created, edited, deleted or published on the Webflow site.
 - Setup: Webflow → Site settings → Apps & integrations → API access → generate a site token (read access to forms is enough). Set `WEBFLOW_API_TOKEN` and `WEBFLOW_SITE_ID`.
-- Runs in a daily job (see Deploy) and on the dashboard's **Sync** button. A submission that fails to process isn't recorded, so the next run retries it. Each submission is stored once (de-duplicated as `webflow:<id>`); `WEBFLOW_LOOKBACK_DAYS` (default 90) bounds how far back it looks.
+- Two ways it runs, and nothing else (there is no scheduled job): (1) **automatically in the background whenever a marketing team member opens the dashboard** (or returns to a tab that has been idle), as a *quick* check that reads Webflow's newest page and stops at the first page with nothing new, usually one request of 1.5 to 4 seconds; (2) the **Sync** button, a *full sweep* of every page back to `WEBFLOW_LOOKBACK_DAYS`. A browser that has synced in the last 2 minutes doesn't repeat the automatic check, and shared-link visitors never trigger one. A submission that fails to process isn't recorded, so the next sync retries it (the quick check re-reads the newest page every time, so a failure is retried on the very next open). Each submission is stored once (de-duplicated as `webflow:<id>`); `WEBFLOW_LOOKBACK_DAYS` (default 90) bounds how far back the full sweep looks.
 - Mapping: sender = Email, name = First + Last Name, subject = `Contact form – <Organisation>`, message = the form's free-text box (Webflow calls it "Field"). Organisation, designation and phone are appended to the full message. Sorting is based on the message only.
 
 ## Only new entries, ever
@@ -51,7 +50,7 @@ Every Webflow submission is recorded by id in `ingested_messages` the first time
 
 ## Deploy (Vercel)
 
-Import the repo, set the env vars above, deploy. `vercel.json` rewrites every non-`/api` path to the SPA and runs `/api/ingest` once a day at 04:00 UTC (09:30 IST), which fits Vercel's free plan. Admins can also press **Sync** in the dashboard at any time to pull new submissions immediately. Set `CRON_SECRET` on Vercel so the scheduled run is authorised.
+Import the repo, set the env vars above, deploy. `vercel.json` rewrites every non-`/api` path to the SPA and sends every `/api/...` request to the one API function. There is no cron job: entries are pulled when someone opens the dashboard, and whenever someone presses **Sync**, so nothing is imported while nobody is looking (the next visit catches up).
 
 ## How access works
 
@@ -61,7 +60,7 @@ Import the repo, set the env vars above, deploy. `vercel.json` rewrites every no
 
 ## Defaults I chose for the open assumptions (change if wrong)
 
-1. **Ingestion:** Webflow's form-submissions API, polled daily plus the Sync button (no webhooks). An earlier version also read a Gmail mailbox; that was removed because only the website forms are used. It's in the git history (`server/lib/gmail.js`) if it's ever needed again.
+1. **Ingestion:** Webflow's form-submissions API, read when the dashboard is opened and when **Sync** is pressed (no scheduled job, no webhooks). An earlier version also read a Gmail mailbox; that was removed because only the website forms are used. It's in the git history (`server/lib/gmail.js`) if it's ever needed again.
 2. **Admin access:** shared password plus name dropdown, as specified. There's no per-person revocation or rate limiting beyond a 600 ms delay on failed logins. Consider a longer, non-guessable password.
 3. **Link expiry:** 7 days (`MAGIC_LINK_TTL_DAYS`).
 4. **Email provider:** Resend.

@@ -440,11 +440,16 @@ test('delete: admin-only, Partnership items only, and the sync remembers it', as
   assert.equal((await remove(SPAM, { cookie })).status, 404); // already gone
 });
 
-test('ingest endpoint: needs cron secret or admin', async () => {
+test('sync endpoint: marketing team only; there is no scheduler secret any more', async () => {
   resetDb();
-  process.env.CRON_SECRET = 'cron-secret-value';
-  assert.equal((await call('/api/ingest')).status, 401);
-  assert.equal((await call('/api/ingest', { token: 'item-link-token-for-complaint-1' })).status, 403);
+  const sync = (opts = {}) => call('/api/ingest', { method: 'POST', ...opts });
+  assert.equal((await sync()).status, 401); // anonymous
+  assert.equal((await sync({ token: 'item-link-token-for-complaint-1' })).status, 403); // magic link
+  assert.equal((await call('/api/ingest')).status, 405); // GET was only for the removed daily job
+  // a bearer secret no longer opens it, even if one is still set in the environment
+  process.env.CRON_SECRET = 'old-secret';
+  const withSecret = await realFetch(`${base}/api/ingest`, { method: 'POST', headers: { authorization: 'Bearer old-secret' } });
+  assert.equal(withSecret.status, 401);
   delete process.env.CRON_SECRET;
 });
 

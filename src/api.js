@@ -65,5 +65,6 @@ export const api = {
   deleteItem: (id) => request(`/items/${id}`, { method: 'DELETE' }),
   setCategory: (id, category) => request(`/items/${id}/category`, { method: 'PATCH', body: { category } }),
   notify: (itemId, email, ccEmail, note) => request('/escalate', { method: 'POST', body: { itemId, email, ccEmail, note } }),
-  sync: () => request('/ingest', { method: 'POST' }),
+  // quick = the automatic background check; the Sync button does a full sweep.
+  sync: (quick = false) => request(`/ingest${quick ? '?mode=quick' : ''}`, { method: 'POST' }),
 };

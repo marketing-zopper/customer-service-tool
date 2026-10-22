@@ -3,6 +3,5 @@
     { "source": "/api/:path*", "destination": "/api?__path=:path*" },
     { "source": "/((?!api/).*)", "destination": "/index.html" }
   ],
-  "functions": { "api/index.js": { "maxDuration": 60 } },
-  "crons": [{ "path": "/api/ingest", "schedule": "0 4 * * *" }]
+  "functions": { "api/index.js": { "maxDuration": 60 } }
 }

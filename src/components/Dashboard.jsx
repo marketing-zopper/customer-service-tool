@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { NavLink } from 'react-router-dom';
-import { Archive, Inbox, LogOut, RefreshCw } from 'lucide-react';
+import { Archive, Inbox, RefreshCw } from 'lucide-react';
 import { api } from '../api.js';
 import { SECTIONS, STATUS_LABELS } from '../sections.js';
-import ItemCard from './ItemCard.jsx';
+import { isStale, lastSyncAt, markSynced } from '../autoSync.js';
+import ItemRow from './ItemRow.jsx';
 import NotifyModal from './NotifyModal.jsx';
 import SearchBox from './SearchBox.jsx';
+import Sidebar from './Sidebar.jsx';
 
 export default function Dashboard({ session, sectionKey, onSignOut }) {
   const section = SECTIONS[sectionKey];
@@ -24,6 +25,7 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
   const [searchTerm, setSearchTerm] = useState(''); // the query actually being searched (debounced)
   const [resultsFor, setResultsFor] = useState(''); // the query the list on screen answers
   const latestRequest = useRef(0);
+  const syncingRef = useRef(false); // true while a sync is running, so two never overlap
 
   const showToast = useCallback((message, tone = 'info') => {
     setToast({ message, tone });
@@ -121,25 +123,53 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
     }
   }
 
-  async function sync() {
+  /**
+   * Pulls new website-form submissions. `quiet` is the automatic background run: it stays silent
+   * unless something new arrives or something goes wrong, and only refreshes the list when needed.
+   * The Sync button runs it loudly and always refreshes.
+   */
+  async function runSync({ quiet = false } = {}) {
+    if (syncingRef.current) return;
+    syncingRef.current = true;
     setSyncing(true);
     try {
-      const result = await api.sync();
-      await load();
+      const result = await api.sync(quiet);
+      markSynced();
       const broken = Object.entries(result.sources).filter(([, source]) => source.error);
       if (broken.length) {
         showToast(`Sync problem (${broken.map(([name]) => name).join(', ')}): ${broken[0][1].error}`, 'error');
       } else if (result.processed) {
+        await loadRef.current();
         showToast(`${result.processed} new item${result.processed === 1 ? '' : 's'} added`);
-      } else {
+      } else if (!quiet) {
+        await loadRef.current();
         showToast('Nothing new. Already up to date');
       }
     } catch (err) {
-      showToast(err.message, 'error');
+      showToast(quiet ? `Couldn't check for new entries: ${err.message}` : err.message, 'error');
     } finally {
+      syncingRef.current = false;
       setSyncing(false);
     }
   }
+
+  // The effects below must always call the latest versions of these.
+  const loadRef = useRef(load);
+  loadRef.current = load;
+  const runSyncRef = useRef(runSync);
+  runSyncRef.current = runSync;
+
+  // Automatic sync: when the dashboard is opened, and when a tab left open in the background is
+  // brought back. Only for the marketing team (shared-link visitors can't sync).
+  useEffect(() => {
+    if (!isAdmin) return undefined;
+    const checkForNew = () => {
+      if (document.visibilityState === 'visible' && isStale(lastSyncAt())) runSyncRef.current({ quiet: true });
+    };
+    checkForNew();
+    document.addEventListener('visibilitychange', checkForNew);
+    return () => document.removeEventListener('visibilitychange', checkForNew);
+  }, [isAdmin]);
 
   const counts = useMemo(() => {
     const result = { all: items?.length ?? 0 };
@@ -153,138 +183,152 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
     ? new Date(session.expiresAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })
     : null;
 
+  const pending = resultsFor !== searchTerm; // a newer search is on its way; the list on screen is stale
+  const title = singleItem ? 'Item for your review' : showArchived ? `Archived · ${section.label}` : section.label;
+  const subtitle = singleItem
+    ? "You were sent this item. Update its status below when you've dealt with it."
+    : showArchived
+      ? 'Archived items are hidden from the active list. Restore one to bring it back.'
+      : items && !searchTerm
+        ? `${items.length} ${items.length === 1 ? 'item' : 'items'}`
+        : '';
+
   return (
-    <div className="app">
-      <header className="topbar">
-        <div className="topbar-inner">
-          <div className="brand">
-            <img src="/logo.png" alt="" width="32" height="32" />
-            <span>Zopper Service Triage</span>
-          </div>
+    <div className="shell">
+      <Sidebar session={session} isAdmin={isAdmin} onSignOut={onSignOut} expires={expires} />
 
+      <main className="main">
+        <header className="main-head">
+          <div className="main-title">
+            <h1>{title}</h1>
+            {subtitle && <p className="muted main-sub">{subtitle}</p>}
+          </div>
           {isAdmin && (
-            <nav className="tabs" aria-label="Sections">
-              {Object.values(SECTIONS).map((s) => (
-                <NavLink key={s.slug} to={`/dashboard/${s.slug}`} className={({ isActive }) => `tab${isActive ? ' tab--active' : ''}`}>
-                  {s.tabLabel}
-                </NavLink>
-              ))}
-            </nav>
+            <button className="btn btn--glass btn--sm" onClick={() => runSync()} disabled={syncing} title="Pull new website form submissions">
+              <RefreshCw size={15} className={syncing ? 'spin' : ''} aria-hidden="true" /> {syncing ? 'Syncing…' : 'Sync'}
+            </button>
           )}
-
-          <div className="topbar-user">
-            {isAdmin ? (
-              <>
-                <button className="btn btn--ghost btn--sm" onClick={sync} disabled={syncing} title="Pull new website form submissions">
-                  <RefreshCw size={15} className={syncing ? 'spin' : ''} aria-hidden="true" /> <span className="hide-sm">Sync</span>
-                </button>
-                <span className="user-chip hide-sm">{session.name}</span>
-                <button className="icon-btn" onClick={onSignOut} aria-label="Sign out" title="Sign out">
-                  <LogOut size={18} />
-                </button>
-              </>
-            ) : (
-              <span className="user-chip">Shared link{expires ? ` · until ${expires}` : ''}</span>
-            )}
-          </div>
-        </div>
-      </header>
-
-      <main className="content">
-        <div className="page-head">
-          <div className="page-head-row">
-            <h1>{singleItem ? 'Item for your review' : showArchived ? `Archived · ${section.label}` : section.label}</h1>
-            {!singleItem && (
-              <SearchBox
-                value={query}
-                onChange={setQuery}
-                placeholder="Search name, email, phone, message…"
-                label={`Search ${showArchived ? 'archived ' : ''}${section.tabLabel.toLowerCase()} by name, email, phone or message`}
-              />
-            )}
-          </div>
-          {singleItem && <p className="muted">You were sent this item. Update its status below when you've dealt with it.</p>}
-          {showArchived && <p className="muted">Archived items are hidden from the active list. Restore one to bring it back.</p>}
-          {/* Only claim a count once the list on screen really is the answer to this search. */}
-          {searchTerm && items && resultsFor === searchTerm && (
-            <p className="muted search-meta" aria-live="polite">
-              {items.length} result{items.length === 1 ? '' : 's'} for “{searchTerm}”
-            </p>
-          )}
-        </div>
+        </header>
 
         {!singleItem && (
-          <div className="filters" role="group" aria-label="Filter by status">
-            {!showArchived &&
-              items &&
-              items.length > 0 &&
-              ['all', ...section.statuses].map((status) => (
-                <button
-                  key={status}
-                  className={`chip${filter === status ? ' chip--active' : ''}`}
-                  onClick={() => setFilter(status)}
-                  aria-pressed={filter === status}
-                >
-                  {status === 'all' ? 'All' : STATUS_LABELS[status]} <span className="chip-count">{counts[status]}</span>
-                </button>
-              ))}
+          <div className="tabs-row">
+            <div className="status-tabs" role="group" aria-label="Filter by status">
+              {showArchived ? (
+                <span className="status-tab status-tab--active">
+                  Archived <span className="tab-count">{items?.length ?? archivedCount}</span>
+                </span>
+              ) : (
+                items &&
+                items.length > 0 &&
+                ['all', ...section.statuses].map((status) => (
+                  <button
+                    key={status}
+                    className={`status-tab${filter === status ? ' status-tab--active' : ''}`}
+                    onClick={() => setFilter(status)}
+                    aria-pressed={filter === status}
+                  >
+                    {status === 'all' ? 'All' : STATUS_LABELS[status]} <span className="tab-count">{counts[status]}</span>
+                  </button>
+                ))
+              )}
+            </div>
             {isAdmin && (
-              <button
-                className={`chip chip--archive${showArchived ? ' chip--active' : ''}`}
-                onClick={() => setShowArchived((value) => !value)}
-                aria-pressed={showArchived}
-              >
-                <Archive size={14} aria-hidden="true" />
+              <button className="views-link" onClick={() => setShowArchived((value) => !value)} aria-pressed={showArchived}>
+                <Archive size={15} aria-hidden="true" />
                 {showArchived ? 'Back to active' : 'Archived'}
-                {!showArchived && <span className="chip-count">{archivedCount}</span>}
+                {!showArchived && items !== null && <span className="tab-count">{archivedCount}</span>}
               </button>
             )}
           </div>
         )}
 
+        {!singleItem && (
+          <div className="toolbar">
+            <SearchBox
+              value={query}
+              onChange={setQuery}
+              placeholder="Search name, email, phone, message…"
+              label={`Search ${showArchived ? 'archived ' : ''}${section.tabLabel.toLowerCase()} by name, email, phone or message`}
+            />
+            {/* Only claim a count once the list on screen really is the answer to this search. */}
+            {searchTerm && items && !pending && (
+              <p className="muted search-meta" aria-live="polite">
+                {items.length} result{items.length === 1 ? '' : 's'} for “{searchTerm}”
+              </p>
+            )}
+          </div>
+        )}
+
         {error && (
-          <p className="form-error" role="alert">
+          <p className="form-error main-error" role="alert">
             {error}
           </p>
         )}
 
-        {items === null ? (
-          <div className="skeleton-list" aria-hidden="true">
-            <div className="skeleton" />
-            <div className="skeleton" />
-            <div className="skeleton" />
-          </div>
-        ) : visible.length === 0 && !error ? (
-          <div className="empty">
-            <Inbox size={28} aria-hidden="true" />
-            <p>
-              {items.length > 0
-                ? `Nothing marked "${STATUS_LABELS[filter]}".`
-                : searchTerm
-                  ? `No results for “${searchTerm}”. Try fewer words, or part of a name, email or phone number.`
-                  : showArchived
-                    ? 'Nothing archived yet.'
-                    : section.emptyText}
-            </p>
-          </div>
-        ) : (
-          <div className={`list${resultsFor !== searchTerm ? ' list--pending' : ''}`} aria-busy={resultsFor !== searchTerm}>
-            {visible.map((item) => (
-              <ItemCard
-                key={item.id}
-                item={item}
-                statuses={section.statuses}
-                canNotify={isAdmin && !showArchived}
-                onStatusChange={changeStatus}
-                onNotify={setNotifying}
-                onDelete={isAdmin && section.category === 'partnership' ? deleteItem : undefined}
-                onMove={isAdmin && !showArchived ? moveItem : undefined}
-                onArchive={isAdmin ? archiveItem : undefined}
-                archived={showArchived}
-              />
-            ))}
-          </div>
-        )}
+        <div className="dt" role="table" aria-label={section.label}>
+          {items !== null && visible.length > 0 && (
+            <div className="dt-head" role="row">
+              <div className="dt-th dt-num" role="columnheader">
+                #
+              </div>
+              <div className="dt-th dt-sender" role="columnheader">
+                Sender
+              </div>
+              <div className="dt-th dt-query" role="columnheader">
+                Query
+              </div>
+              <div className="dt-th dt-time" role="columnheader">
+                Received
+              </div>
+              <div className="dt-th dt-status" role="columnheader">
+                Status
+              </div>
+              <div className="dt-th dt-actions" role="columnheader">
+                <span className="sr-only">Actions</span>
+              </div>
+            </div>
+          )}
+
+          {items === null ? (
+            <div className="dt-skeleton" aria-hidden="true">
+              <div className="skeleton" />
+              <div className="skeleton" />
+              <div className="skeleton" />
+              <div className="skeleton" />
+            </div>
+          ) : visible.length === 0 && !error ? (
+            <div className="empty">
+              <Inbox size={28} aria-hidden="true" />
+              <p>
+                {items.length > 0
+                  ? `Nothing marked "${STATUS_LABELS[filter]}".`
+                  : searchTerm
+                    ? `No results for “${searchTerm}”. Try fewer words, or part of a name, email or phone number.`
+                    : showArchived
+                      ? 'Nothing archived yet.'
+                      : section.emptyText}
+              </p>
+            </div>
+          ) : (
+            <div className={`dt-body${pending ? ' dt-body--pending' : ''}`} role="rowgroup" aria-busy={pending}>
+              {visible.map((item, index) => (
+                <ItemRow
+                  key={item.id}
+                  index={index + 1}
+                  item={item}
+                  statuses={section.statuses}
+                  canNotify={isAdmin && !showArchived}
+                  onStatusChange={changeStatus}
+                  onNotify={setNotifying}
+                  onDelete={isAdmin && section.category === 'partnership' ? deleteItem : undefined}
+                  onMove={isAdmin && !showArchived ? moveItem : undefined}
+                  onArchive={isAdmin ? archiveItem : undefined}
+                  archived={showArchived}
+                />
+              ))}
+            </div>
+          )}
+        </div>
       </main>
 
       {notifying && (

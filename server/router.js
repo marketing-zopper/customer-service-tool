@@ -5,7 +5,6 @@ import {
   authenticate,
   checkAdminPassword,
   clearSessionCookie,
-  constantTimeMatch,
   hashToken,
   newToken,
   requireAdmin,
@@ -227,11 +226,11 @@ const handlers = {
     return { item: updated, emailSent, emailError, expiresAt, ccEmail: cc, ...(emailSent ? {} : { link: url }) };
   },
 
-  async ingest({ req, auth }) {
-    const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-    const cronOk = Boolean(process.env.CRON_SECRET) && constantTimeMatch(bearer, process.env.CRON_SECRET);
-    if (!cronOk) requireAdmin(auth);
-    return runIngest();
+  // Sync with Webflow. ?mode=quick is the dashboard's automatic check when it is opened (newest page
+  // only); without it, the Sync button's full sweep. Only the marketing team can trigger either.
+  async ingest({ auth, url }) {
+    requireAdmin(auth);
+    return runIngest({ quick: url.searchParams.get('mode') === 'quick' });
   },
 };
 
@@ -249,9 +248,7 @@ const routes = [
   ['PATCH', /^\/api\/items\/(?<id>[0-9a-f-]{36})\/status$/, handlers.updateStatus],
   ['PATCH', /^\/api\/items\/(?<id>[0-9a-f-]{36})\/category$/, handlers.setCategory],
   ['POST', /^\/api\/escalate$/, handlers.escalate],
-  // Called by the cron scheduler (bearer CRON_SECRET) or by an admin's "Sync" button
-  ['GET', /^\/api\/ingest$/, handlers.ingest, { auth: 'optional' }],
-  ['POST', /^\/api\/ingest$/, handlers.ingest, { auth: 'optional' }],
+  ['POST', /^\/api\/ingest$/, handlers.ingest],
 ];
 
 export async function handle(req, res) {

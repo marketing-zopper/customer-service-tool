@@ -14,6 +14,7 @@ const realFetch = globalThis.fetch;
 const tables = { mail_items: [], ingested_messages: [] };
 let webflowSubmissions = [];
 let webflowRequests = [];
+let webflowPages = []; // offsets of the pages that were requested
 
 const submission = (id, message, extra = {}) => ({
   id,
@@ -65,7 +66,10 @@ before(() => {
     if (href.startsWith(process.env.SUPABASE_URL)) return Promise.resolve(fakeSupabase(href, init));
     if (href.startsWith('https://api.webflow.com')) {
       webflowRequests.push(init?.method || 'GET');
-      return Promise.resolve(new Response(JSON.stringify({ formSubmissions: webflowSubmissions, pagination: { total: webflowSubmissions.length } }), { status: 200 }));
+      const offset = Number(new URL(href).searchParams.get('offset') || 0);
+      webflowPages.push(offset);
+      const page = webflowSubmissions.slice(offset, offset + 100);
+      return Promise.resolve(new Response(JSON.stringify({ formSubmissions: page, pagination: { total: webflowSubmissions.length } }), { status: 200 }));
     }
     return realFetch(url, init);
   };
@@ -79,6 +83,7 @@ const reset = (subs) => {
   tables.ingested_messages = [];
   webflowSubmissions = subs;
   webflowRequests = [];
+  webflowPages = [];
 };
 const wf = (summary) => summary.sources.webflow;
 
@@ -132,10 +137,71 @@ test('only genuinely new submissions are added on the next sync', async () => {
   assert.deepEqual(tables.mail_items.map((r) => r.source_id).sort(), ['webflow:d1', 'webflow:d2', 'webflow:d3']);
 });
 
-test('two syncs running at the same moment (cron + Sync button) never create duplicates', async () => {
+test('two syncs running at the same moment (two people, or open + Sync button) never create duplicates', async () => {
   reset([COMPLAINT('e1'), PARTNER('e2')]);
   await Promise.all([runIngest(), runIngest(), runIngest()]);
   const ids = tables.mail_items.map((r) => r.source_id);
   assert.equal(new Set(ids).size, ids.length);
   assert.equal(ids.length, 2);
 });
+
+// --- quick mode: the dashboard's automatic background check -------------------------------------
+
+const many = (count, prefix) => Array.from({ length: count }, (_, i) => COMPLAINT(`${prefix}${i}`));
+
+test('quick sync reads a single Webflow page when nothing is new', async () => {
+  reset(many(250, 'a'));
+  const first = await runIngest(); // a full sweep: 3 pages, everything imported
+  assert.equal(wf(first).processed, 250);
+  assert.deepEqual(webflowPages, [0, 100, 200]);
+
+  webflowPages = [];
+  const quick = await runIngest({ quick: true });
+  assert.equal(wf(quick).found, 0);
+  assert.equal(wf(quick).processed, 0);
+  assert.deepEqual(webflowPages, [0]); // one request instead of three
+});
+
+test('quick sync imports what is new, confirms with one more page, then stops', async () => {
+  reset(many(250, 'b'));
+  await runIngest();
+  webflowSubmissions = [...many(3, 'fresh'), ...webflowSubmissions]; // newest first
+  webflowPages = [];
+
+  const quick = await runIngest({ quick: true });
+  assert.equal(wf(quick).processed, 3);
+  assert.equal(tables.mail_items.length, 253);
+  assert.deepEqual(webflowPages, [0, 100]); // page 1 had new items; page 2 had none, so it stopped there
+});
+
+test('quick sync leaves old stragglers to the full sweep, which finds them', async () => {
+  reset(many(250, 'c'));
+  await runIngest();
+  // one old submission was never imported (say it failed once); it sits on the last page
+  const straggler = webflowSubmissions[240];
+  tables.mail_items = tables.mail_items.filter((r) => r.source_id !== `webflow:${straggler.id}`);
+  tables.ingested_messages = tables.ingested_messages.filter((r) => r.source_id !== `webflow:${straggler.id}`);
+
+  assert.equal(wf(await runIngest({ quick: true })).processed, 0); // not worth reading old pages for
+  assert.equal(wf(await runIngest()).processed, 1); // the daily run / Sync button catches it
+  assert.equal(tables.mail_items.length, 250);
+});
+
+test('a page of other forms\' sign-ups does not hide real entries behind it, and nothing is ever written to Webflow', async () => {
+  const noise = (count, tag) => Array.from({ length: count }, (_, i) => ({ ...COMPLAINT(`${tag}${i}`), displayName: 'Subscribe to Zopper' }));
+  reset([...noise(100, 'n'), ...many(5, 'd')]); // the newest page is all newsletter sign-ups
+  const quick = await runIngest({ quick: true });
+  assert.equal(wf(quick).processed, 5); // a page with none of ours proves nothing, so it kept reading
+  assert.deepEqual(webflowPages, [0, 100]);
+  assert.ok(webflowRequests.every((m) => m === 'GET'));
+});
+
+test('the automatic check is bounded: it never reads more than five pages', async () => {
+  reset(noiseOnly(900));
+  await runIngest({ quick: true });
+  assert.equal(webflowPages.length, 5);
+});
+
+function noiseOnly(count) {
+  return Array.from({ length: count }, (_, i) => ({ ...COMPLAINT(`only${i}`), displayName: 'Subscribe to Zopper' }));
+}

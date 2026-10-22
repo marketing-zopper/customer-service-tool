@@ -68,21 +68,29 @@ export function toItem(submission) {
   };
 }
 
-/** Submissions of the two triaged forms from the last `days` days, newest first. */
-export async function fetchSubmissions(days, maxPages = 30) {
+/**
+ * Yields the triaged forms' submissions one Webflow page (100 submissions) at a time, newest first,
+ * going back at most `days` days. Each request to Webflow is slow (often several seconds), so a
+ * caller that only needs what's new can stop early instead of reading every page.
+ */
+export async function* submissionPages(days, maxPages = 30) {
   const site = process.env.WEBFLOW_SITE_ID;
   const cutoff = Date.now() - days * 86_400_000;
   const wanted = new Set(env('WEBFLOW_FORMS', WEBFLOW_FORMS.join('|')).split('|'));
-  const items = [];
 
   for (let page = 0; page < maxPages; page += 1) {
     const { formSubmissions, pagination } = await get(`/sites/${site}/form_submissions?limit=100&offset=${page * 100}`);
-    for (const submission of formSubmissions) {
-      if (new Date(submission.dateSubmitted).getTime() < cutoff) continue;
-      if (wanted.has(submission.displayName)) items.push(toItem(submission));
-    }
+    yield formSubmissions
+      .filter((submission) => new Date(submission.dateSubmitted).getTime() >= cutoff && wanted.has(submission.displayName))
+      .map(toItem);
     const oldest = formSubmissions.at(-1)?.dateSubmitted;
-    if (!oldest || new Date(oldest).getTime() < cutoff || (page + 1) * 100 >= pagination.total) break;
+    if (!oldest || new Date(oldest).getTime() < cutoff || (page + 1) * 100 >= pagination.total) return;
   }
+}
+
+/** Everything from the last `days` days: the full sweep. */
+export async function fetchSubmissions(days, maxPages = 30) {
+  const items = [];
+  for await (const page of submissionPages(days, maxPages)) items.push(...page);
   return items;
 }
