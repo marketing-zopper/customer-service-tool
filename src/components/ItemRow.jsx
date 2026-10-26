@@ -22,12 +22,15 @@ const initialsOf = (label) =>
 const tintOf = (label) => AVATAR_TINTS[[...label].reduce((sum, ch) => sum + ch.charCodeAt(0), 0) % AVATAR_TINTS.length];
 
 /** One entry of the table. Everything an item card used to offer lives in this row. */
-export default function ItemRow({ index, item, statuses, canNotify, onStatusChange, onNotify, onMove, onDelete, onArchive, archived, readOnlyStatus = false }) {
+export default function ItemRow({ index, item, statuses, canNotify, onStatusChange, onNotify, onMove, onDelete, onArchive, archived, readOnlyStatus = false, onCommentSaved }) {
   const [confirming, setConfirming] = useState(false);
   const [open, setOpen] = useState(false);
   const [body, setBody] = useState(null);
   const [bodyError, setBodyError] = useState('');
   const [comments, setComments] = useState([]);
+  const [draft, setDraft] = useState('');
+  const [posting, setPosting] = useState(false);
+  const [postError, setPostError] = useState('');
 
   const otherCategory = item.category === 'partnership' ? 'complaint_enquiry' : 'partnership';
   const otherLabel = otherCategory === 'partnership' ? 'Partnership' : 'Complaints';
@@ -56,6 +59,24 @@ export default function ItemRow({ index, item, statuses, canNotify, onStatusChan
     if (open && body !== null) loadBody();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [item.updated_at, item.comment_count]);
+
+  // Anyone on the marketing team can add a comment to the thread (the person notified uses the response panel).
+  async function postComment(event) {
+    event.preventDefault();
+    if (!draft.trim()) return;
+    setPosting(true);
+    setPostError('');
+    try {
+      const result = await api.respond(item.id, undefined, draft);
+      setComments((list) => [...list, result.comment]);
+      setDraft('');
+      onCommentSaved?.(result.item);
+    } catch (error) {
+      setPostError(error.message);
+    } finally {
+      setPosting(false);
+    }
+  }
 
   function openDetail() {
     if (open) return;
@@ -199,7 +220,7 @@ export default function ItemRow({ index, item, statuses, canNotify, onStatusChan
             )}
           </div>
 
-          {comments.length > 0 && (
+          {(comments.length > 0 || onCommentSaved) && (
             <div className="thread">
               <h3>Comments</h3>
               {comments.map((entry) => (
@@ -213,6 +234,27 @@ export default function ItemRow({ index, item, statuses, canNotify, onStatusChan
                   {entry.body && <p>{entry.body}</p>}
                 </article>
               ))}
+              {onCommentSaved && (
+                <form className="thread-form" onSubmit={postComment}>
+                  <textarea
+                    value={draft}
+                    onChange={(e) => setDraft(e.target.value)}
+                    rows={2}
+                    maxLength={2000}
+                    disabled={posting}
+                    placeholder="Add a comment…"
+                    aria-label="Add a comment"
+                  />
+                  <button className="btn btn--escalate-solid" disabled={posting || !draft.trim()}>
+                    {posting ? 'Saving…' : 'Comment'}
+                  </button>
+                  {postError && (
+                    <p className="form-error" role="alert">
+                      {postError}
+                    </p>
+                  )}
+                </form>
+              )}
             </div>
           )}
         </div>

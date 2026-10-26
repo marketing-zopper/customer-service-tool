@@ -1654,3 +1654,31 @@ button {
     padding: 26px 20px;
   }
 }
+
+/* Comment form for the marketing team, under an open row's thread */
+.thread-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+.thread-form textarea {
+  flex: 1 1 260px;
+  min-width: 0;
+  padding: 10px 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.8);
+  font: inherit;
+  font-size: 14px;
+  resize: vertical;
+}
+.thread-form textarea:focus {
+  outline: 2px solid var(--blue-light);
+  outline-offset: 1px;
+}
+.thread-form .form-error {
+  flex-basis: 100%;
+  margin: 0;
+}

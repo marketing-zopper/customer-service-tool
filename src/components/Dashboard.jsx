@@ -340,6 +340,7 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
                   onArchive={isAdmin ? archiveItem : undefined}
                   archived={showArchived}
                   readOnlyStatus={Boolean(singleItem)}
+                  onCommentSaved={isAdmin ? (updated) => patchItem(updated.id, updated) : undefined}
                 />
               ))}
             </div>
