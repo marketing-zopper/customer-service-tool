@@ -59,7 +59,11 @@ export function renderNotificationEmail({ item, url, notifiedBy, notifiedByEmail
   const expiry = expiresAt
     ? new Date(expiresAt).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'long', year: 'numeric' })
     : null;
-  const intro = `${notifiedBy} (${notifiedByEmail}) from the marketing team has notified you about this ${label.toLowerCase()}.`;
+  // The first CC address is the person who pressed Notify; any others are copied in as well.
+  const [notifierEmail, ...alsoCopied] = [].concat(notifiedByEmail);
+  const intro =
+    `${notifiedBy} (${notifierEmail}) from the marketing team has notified you about this ${label.toLowerCase()}.` +
+    (alsoCopied.length ? ` Also copied: ${alsoCopied.join(', ')}.` : '');
 
   const factRows = facts
     .map(
@@ -115,11 +119,14 @@ export function renderNotificationEmail({ item, url, notifiedBy, notifiedByEmail
 }
 
 /**
- * Sends the notification through Resend. `cc` is the employee who pressed Notify; replies go to
- * them too, since the message itself is sent from a shared address. Throws on failure.
+ * Sends the notification through Resend. `cc` is one address or a list, the first being the employee
+ * who pressed Notify; replies go to all of them, since the message itself is sent from a shared address. Throws on failure.
  */
 export async function sendNotificationEmail({ to, cc, item, url, notifiedBy, note, expiresAt }) {
-  const { html, text } = renderNotificationEmail({ item, url, notifiedBy, notifiedByEmail: cc, note, expiresAt });
+  const ccList = [].concat(cc).filter(Boolean);
+  const { html, text } = renderNotificationEmail({ item, url, notifiedBy, notifiedByEmail: ccList, note, expiresAt });
+  // Anyone who is also the recipient doesn't need a copy.
+  const copies = ccList.filter((address) => address.toLowerCase() !== to.toLowerCase());
   const response = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
@@ -130,8 +137,8 @@ export async function sendNotificationEmail({ to, cc, item, url, notifiedBy, not
       from: env('MAIL_FROM', 'Zopper Service Triage <onboarding@resend.dev>'),
       to: [to],
       // If they notified themselves there's nobody else to copy.
-      ...(cc.toLowerCase() !== to.toLowerCase() ? { cc: [cc] } : {}),
-      reply_to: cc,
+      ...(copies.length ? { cc: copies } : {}),
+      reply_to: ccList.length > 1 ? ccList : ccList[0],
       subject: `[${CATEGORY_LABELS[item.category]}] ${item.subject || 'Item needs your attention'}`,
       html,
       text,

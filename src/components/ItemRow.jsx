@@ -21,8 +21,21 @@ const initialsOf = (label) =>
     .toUpperCase() || '?';
 const tintOf = (label) => AVATAR_TINTS[[...label].reduce((sum, ch) => sum + ch.charCodeAt(0), 0) % AVATAR_TINTS.length];
 
+/**
+ * The full message as shown when a row is opened: the sender's name and email join the organisation,
+ * designation, phone and "submitted via" lines that Webflow forms add at the end of the message.
+ */
+function withContactDetails(body, item) {
+  const contact = [item.sender_name && `Name: ${item.sender_name}`, item.sender_email && item.sender_email !== 'unknown' && `Email: ${item.sender_email}`].filter(Boolean);
+  if (contact.length === 0) return body;
+  const block = contact.join('\n');
+  const at = body.search(/^(Organisation|Designation|Phone|Submitted via): /m);
+  if (at === -1) return `${body}\n\n${block}`;
+  return `${body.slice(0, at)}${block}\n${body.slice(at)}`;
+}
+
 /** One entry of the table. Everything an item card used to offer lives in this row. */
-export default function ItemRow({ index, item, statuses, canNotify, onStatusChange, onNotify, onMove, onDelete, onArchive, archived, readOnlyStatus = false, onCommentSaved }) {
+export default function ItemRow({ index, item, statuses, canNotify, onStatusChange, onNotify, onMove, onDelete, onArchive, archived, readOnlyStatus = false, onCommentSaved, onItemChanged, showComments = false }) {
   const [confirming, setConfirming] = useState(false);
   const [open, setOpen] = useState(false);
   const [body, setBody] = useState(null);
@@ -30,6 +43,8 @@ export default function ItemRow({ index, item, statuses, canNotify, onStatusChan
   const [comments, setComments] = useState([]);
   const [draft, setDraft] = useState('');
   const [posting, setPosting] = useState(false);
+  const [deleting, setDeleting] = useState(null); // id of the comment awaiting confirmation
+  const [deleteBusy, setDeleteBusy] = useState(false);
   const [postError, setPostError] = useState('');
 
   const otherCategory = item.category === 'partnership' ? 'complaint_enquiry' : 'partnership';
@@ -78,6 +93,22 @@ export default function ItemRow({ index, item, statuses, canNotify, onStatusChan
     }
   }
 
+  // Anyone can delete the comments they wrote themselves (the server decides which those are).
+  async function removeComment(entry) {
+    setDeleteBusy(true);
+    setPostError('');
+    try {
+      const result = await api.deleteComment(item.id, entry.id);
+      setComments((list) => list.filter((c) => c.id !== entry.id));
+      setDeleting(null);
+      onItemChanged?.(result.item);
+    } catch (error) {
+      setPostError(error.message);
+    } finally {
+      setDeleteBusy(false);
+    }
+  }
+
   function openDetail() {
     if (open) return;
     setOpen(true);
@@ -89,6 +120,17 @@ export default function ItemRow({ index, item, statuses, canNotify, onStatusChan
     setOpen(next);
     if (next && body === null) loadBody();
   }
+
+  const notifyButton = canNotify && (
+    <button className="btn btn--notify btn--sm" onClick={() => onNotify(item)}>
+      <Send size={14} aria-hidden="true" /> Notify
+    </button>
+  );
+  const moveButton = onMove && (
+    <button className="btn btn--move btn--sm" onClick={() => onMove(item, otherCategory)}>
+      <ArrowRightLeft size={14} aria-hidden="true" /> Move to {otherLabel}
+    </button>
+  );
 
   return (
     <div className={`dt-row${open ? ' dt-row--open' : ''}`} role="row">
@@ -118,7 +160,7 @@ export default function ItemRow({ index, item, statuses, canNotify, onStatusChan
             {open ? <ChevronUp size={15} aria-hidden="true" /> : <ChevronDown size={15} aria-hidden="true" />}
             {open ? 'Hide message' : 'Read full message'}
           </button>
-          {item.comment_count > 0 && (
+          {item.comment_count > 0 && !showComments && (
             <button className="comment-badge" onClick={openDetail} title="Show the comments">
               <MessageSquare size={13} aria-hidden="true" /> {item.comment_count} comment{item.comment_count === 1 ? '' : 's'}
             </button>
@@ -154,6 +196,27 @@ export default function ItemRow({ index, item, statuses, canNotify, onStatusChan
           ))}
       </div>
 
+      {showComments && (
+        <div className="dt-cell dt-comments" role="cell">
+          {item.latest_comment ? (
+            <button className="comment-peek" onClick={openDetail} title="Open the comments">
+              <span className="peek-meta">
+                <strong>{item.latest_comment.author}</strong>
+                <span>{commentTime.format(new Date(item.latest_comment.created_at))}</span>
+              </span>
+              <span className="peek-body">{item.latest_comment.body}</span>
+              <span className="peek-count">
+                <MessageSquare size={12} aria-hidden="true" /> {item.comment_count} comment{item.comment_count === 1 ? '' : 's'}
+              </span>
+            </button>
+          ) : (
+            <button className="link-btn peek-empty" onClick={openDetail}>
+              <MessageSquare size={14} aria-hidden="true" /> Add a comment
+            </button>
+          )}
+        </div>
+      )}
+
       {hasActions && (
         <div className="dt-cell dt-actions" role="cell">
           {confirming ? (
@@ -168,16 +231,9 @@ export default function ItemRow({ index, item, statuses, canNotify, onStatusChan
             </div>
           ) : (
             <>
-              {canNotify && (
-                <button className="btn btn--notify btn--sm" onClick={() => onNotify(item)}>
-                  <Send size={14} aria-hidden="true" /> Notify
-                </button>
-              )}
-              {onMove && (
-                <button className="btn btn--move btn--sm" onClick={() => onMove(item, otherCategory)}>
-                  <ArrowRightLeft size={14} aria-hidden="true" /> Move to {otherLabel}
-                </button>
-              )}
+              {/* Complaints lists "Move to Partnership" first; Partnership lists Notify first. */}
+              {showComments ? moveButton : notifyButton}
+              {showComments ? notifyButton : moveButton}
               {/* Grouped so the two icons always wrap together when space runs out. */}
               {(onArchive || (onDelete && !archived)) && (
                 <span className="action-icons">
@@ -207,7 +263,7 @@ export default function ItemRow({ index, item, statuses, canNotify, onStatusChan
         <div className="dt-detail" role="cell">
           <div className="detail-body">
             {body !== null ? (
-              body
+              withContactDetails(body, item)
             ) : bodyError ? (
               <p className="form-error">
                 {bodyError}{' '}
@@ -230,6 +286,22 @@ export default function ItemRow({ index, item, statuses, canNotify, onStatusChan
                     <span className="thread-role">{ROLE_LABELS[entry.author_role] || entry.author_role}</span>
                     <time dateTime={entry.created_at}>{commentTime.format(new Date(entry.created_at))}</time>
                     {entry.status_set && <span className={`thread-status thread-status--${entry.status_set}`}>Set status: {STATUS_LABELS[entry.status_set]}</span>}
+                    {entry.can_delete &&
+                      (deleting === entry.id ? (
+                        <span className="thread-confirm">
+                          Delete this comment?
+                          <button className="btn btn--danger btn--sm" onClick={() => removeComment(entry)} disabled={deleteBusy}>
+                            {deleteBusy ? 'Deleting…' : 'Delete'}
+                          </button>
+                          <button className="btn btn--ghost btn--sm" onClick={() => setDeleting(null)} disabled={deleteBusy}>
+                            Keep
+                          </button>
+                        </span>
+                      ) : (
+                        <button className="icon-action icon-action--danger thread-delete" onClick={() => setDeleting(entry.id)} title="Delete your comment" aria-label="Delete your comment">
+                          <Trash2 size={14} aria-hidden="true" />
+                        </button>
+                      ))}
                   </header>
                   {entry.body && <p>{entry.body}</p>}
                 </article>

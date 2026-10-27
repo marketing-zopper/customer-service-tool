@@ -190,6 +190,8 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
     : null;
 
   const pending = resultsFor !== searchTerm; // a newer search is on its way; the list on screen is stale
+  // Complaints get a Comments column (the latest comment, with the count) between Status and the actions.
+  const showCommentsColumn = isAdmin && section.category === 'complaint_enquiry';
   const title = singleItem ? 'Item for your review' : showArchived ? `Archived · ${section.label}` : section.label;
   const subtitle = singleItem
     ? 'You were sent this item. Use “Your response” to set its status and leave a comment for the team.'
@@ -280,7 +282,7 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
           </p>
         )}
 
-        <div className="dt" role="table" aria-label={section.label}>
+        <div className={`dt${showCommentsColumn ? ' dt--comments' : ''}`} role="table" aria-label={section.label}>
           {items !== null && visible.length > 0 && (
             <div className="dt-head" role="row">
               <div className="dt-th dt-num" role="columnheader">
@@ -298,6 +300,11 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
               <div className="dt-th dt-status" role="columnheader">
                 Status
               </div>
+              {showCommentsColumn && (
+                <div className="dt-th dt-comments" role="columnheader">
+                  Comments
+                </div>
+              )}
               <div className="dt-th dt-actions" role="columnheader">
                 <span className="sr-only">Actions</span>
               </div>
@@ -340,6 +347,8 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
                   onArchive={isAdmin ? archiveItem : undefined}
                   archived={showArchived}
                   readOnlyStatus={Boolean(singleItem)}
+                  showComments={showCommentsColumn}
+                  onItemChanged={(updated) => patchItem(updated.id, updated)}
                   onCommentSaved={isAdmin ? (updated) => patchItem(updated.id, updated) : undefined}
                 />
               ))}

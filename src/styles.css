@@ -1498,8 +1498,34 @@ button {
    Responsive
    ===================================================================== */
 
-/* Narrower than a wide desktop: each row becomes a compact card instead of squeezing columns. */
-@media (max-width: 1349px) {
+/* Laptops and Windows screens with display scaling (1200 to 1349px wide): keep the same table, just
+   tighter, so everyone sees the same layout as on a large monitor. */
+@media (min-width: 1200px) and (max-width: 1349px) {
+  .shell {
+    grid-template-columns: 224px minmax(0, 1fr);
+    gap: 12px;
+    padding: 12px;
+  }
+  .dt {
+    --cols: 36px minmax(140px, 1fr) minmax(160px, 2fr) 100px 128px 296px;
+  }
+  .dt-cell {
+    padding: 12px 10px;
+  }
+  .dt-th {
+    padding: 11px 10px;
+  }
+  .avatar {
+    width: 32px;
+    height: 32px;
+  }
+  .dt-sender {
+    gap: 9px;
+  }
+}
+
+/* Narrower than a laptop (tablets, phones): each row becomes a compact card instead of squeezing columns. */
+@media (max-width: 1199px) {
   .dt-head {
     display: none;
   }
@@ -1681,4 +1707,196 @@ button {
 .thread-form .form-error {
   flex-basis: 100%;
   margin: 0;
+}
+
+/* ---------- Complaints: Comments column (between Status and the actions) ---------- */
+
+.dt--comments {
+  --cols: 48px minmax(190px, 1fr) minmax(200px, 1.8fr) 118px 160px minmax(190px, 1.2fr) 300px;
+}
+.dt--comments .dt-head,
+.dt--comments .dt-row {
+  grid-template-areas: 'num sender query time status comments actions';
+}
+.dt--comments .dt-row--open {
+  grid-template-areas:
+    'num sender query time status comments actions'
+    'detail detail detail detail detail detail detail';
+}
+.dt-comments {
+  grid-area: comments;
+  align-items: flex-start;
+}
+
+.comment-peek {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.peek-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 8px;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+.peek-meta strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+.peek-body {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.peek-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #b9531c;
+  font-size: 12px;
+  font-weight: 600;
+}
+.comment-peek:hover .peek-body {
+  text-decoration: underline;
+  text-decoration-color: var(--line);
+}
+.peek-empty {
+  gap: 5px;
+}
+
+@media (min-width: 1200px) and (max-width: 1499px) {
+  .dt.dt--comments {
+    --cols: 36px minmax(120px, 1fr) minmax(140px, 1.6fr) 96px 120px minmax(150px, 1fr) 260px;
+  }
+}
+
+/* Cards: the comment sits under the query, above the status and actions */
+@media (max-width: 1199px) {
+  .dt--comments .dt-row,
+  .dt--comments .dt-row--open {
+    grid-template-areas:
+      'sender time'
+      'query query'
+      'comments comments'
+      'status actions';
+  }
+  .dt--comments .dt-row--open {
+    grid-template-areas:
+      'sender time'
+      'query query'
+      'comments comments'
+      'detail detail'
+      'status actions';
+  }
+}
+@media (max-width: 640px) {
+  .dt--comments .dt-row,
+  .dt--comments .dt-row--open {
+    grid-template-areas:
+      'sender time'
+      'query query'
+      'comments comments'
+      'status status'
+      'actions actions';
+  }
+  .dt--comments .dt-row--open {
+    grid-template-areas:
+      'sender time'
+      'query query'
+      'comments comments'
+      'detail detail'
+      'status status'
+      'actions actions';
+  }
+}
+
+/* Delete one of your own comments */
+.thread-delete {
+  margin-left: auto;
+  width: 28px;
+  height: 28px;
+}
+.thread-confirm {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  color: var(--ink-soft);
+  font-size: 12.5px;
+}
+.thread .form-error {
+  margin: 4px 0 0;
+}
+
+/* Several CC addresses as chips inside one field */
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.9);
+  font-weight: 400;
+}
+.chips:focus-within {
+  border-color: var(--blue-light);
+  box-shadow: 0 0 0 3px var(--blue-light-tint);
+}
+.field .chips input {
+  flex: 1 1 140px;
+  width: auto;
+  min-width: 120px;
+  min-height: 30px;
+  padding: 0 2px;
+  border: 0;
+  background: none;
+  box-shadow: none;
+}
+.field .chips input:focus {
+  box-shadow: none;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 3px 4px 3px 10px;
+  border-radius: 999px;
+  background: var(--blue-light-tint);
+  color: #0b7aa3;
+  font-size: 13px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.chip button {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.chip button:hover {
+  background: rgba(11, 122, 163, 0.16);
 }

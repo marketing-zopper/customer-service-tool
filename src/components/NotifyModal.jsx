@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Check, Copy, TriangleAlert, X } from 'lucide-react';
 import { api } from '../api.js';
 
-// The employee's own address is remembered in this browser so they type it once, not on every item.
+// The employee's CC address(es) are remembered in this browser so they type them once, not on every item.
 const ccKey = (name) => `zst:notify-cc:${name}`;
 const readSaved = (name) => {
   try {
@@ -19,8 +19,82 @@ const save = (name, value) => {
   }
 };
 
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const CC_MAX = 10;
+const splitEmails = (text) => text.split(/[\s,;]+/).map((part) => part.trim().toLowerCase()).filter(Boolean);
+
+/**
+ * Several addresses in one field: each becomes a chip when you type a comma, space or Enter, paste a list,
+ * or leave the field. Backspace on an empty field takes the last one back.
+ */
+function EmailChips({ value, onChange, inputRef, onProblem }) {
+  const [draft, setDraft] = useState('');
+
+  function commit(text) {
+    const added = [];
+    for (const address of splitEmails(text)) {
+      if (!EMAIL_RE.test(address)) {
+        onProblem(`"${address}" is not a valid email address`);
+        setDraft(address);
+        return false;
+      }
+      if (!value.includes(address) && !added.includes(address)) added.push(address);
+    }
+    if (value.length + added.length > CC_MAX) {
+      onProblem(`You can copy up to ${CC_MAX} email addresses`);
+      return false;
+    }
+    onProblem('');
+    if (added.length) onChange([...value, ...added]);
+    setDraft('');
+    return true;
+  }
+
+  return (
+    <div className="chips">
+      {value.map((address) => (
+        <span className="chip" key={address}>
+          {address}
+          <button type="button" onClick={() => onChange(value.filter((a) => a !== address))} aria-label={`Remove ${address}`}>
+            <X size={12} aria-hidden="true" />
+          </button>
+        </span>
+      ))}
+      <input
+        ref={inputRef}
+        type="text"
+        inputMode="email"
+        value={draft}
+        onChange={(e) => {
+          const text = e.target.value;
+          if (/[,;\s]$/.test(text) && text.trim()) commit(text);
+          else setDraft(text);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' && draft.trim()) {
+            e.preventDefault();
+            commit(draft);
+          } else if (e.key === 'Backspace' && !draft && value.length) onChange(value.slice(0, -1));
+        }}
+        onBlur={() => draft.trim() && commit(draft)}
+        onPaste={(e) => {
+          const text = e.clipboardData.getData('text');
+          if (/[,;\s]/.test(text.trim())) {
+            e.preventDefault();
+            commit(`${draft} ${text}`);
+          }
+        }}
+        placeholder={value.length ? 'Add another…' : 'you@zopper.com'}
+        autoComplete="email"
+        aria-label="CC Email"
+      />
+    </div>
+  );
+}
+
 export default function NotifyModal({ item, adminName, onClose, onNotified }) {
-  const [ccEmail, setCcEmail] = useState(() => readSaved(adminName));
+  const [ccList, setCcList] = useState(() => splitEmails(readSaved(adminName)).filter((a) => EMAIL_RE.test(a)));
+  const [ccProblem, setCcProblem] = useState('');
   const [email, setEmail] = useState(item.assigned_to || '');
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
@@ -41,8 +115,8 @@ export default function NotifyModal({ item, adminName, onClose, onNotified }) {
     setBusy(true);
     setError('');
     try {
-      const response = await api.notify(item.id, email, ccEmail, note);
-      save(adminName, ccEmail.trim());
+      const response = await api.notify(item.id, email, ccList, note);
+      save(adminName, ccList.join(', '));
       onNotified(response.item);
       setResult(response);
     } catch (err) {
@@ -81,7 +155,7 @@ export default function NotifyModal({ item, adminName, onClose, onNotified }) {
             {result.emailSent ? (
               <p className="muted">
                 The full details and a link to this item were emailed to <strong>{email}</strong>, with a copy to{' '}
-                <strong>{result.ccEmail}</strong>
+                <strong>{result.ccEmails?.join(', ') || result.ccEmail}</strong>
                 {expiry && <>. The link expires on {expiry}</>}.
               </p>
             ) : (
@@ -109,23 +183,19 @@ export default function NotifyModal({ item, adminName, onClose, onNotified }) {
             <p className="muted modal-subject">{item.subject || '(no subject)'}</p>
 
             <label className="field">
-              <span>Your email</span>
-              <input
-                ref={ccEmail ? null : firstEmpty}
-                type="email"
-                value={ccEmail}
-                onChange={(e) => setCcEmail(e.target.value)}
-                placeholder="you@zopper.com"
-                autoComplete="email"
-                required
-              />
-              <small className="hint">You'll be copied on the email, and replies to it come to you.</small>
+              <span>CC Email</span>
+              <small className="hint">
+                Add as many as you need (comma, space or Enter between them). Put your own first: everyone listed is copied on the email,
+                and replies to it go to all of them.
+              </small>
+              <EmailChips value={ccList} onChange={setCcList} inputRef={ccList.length ? null : firstEmpty} onProblem={setCcProblem} />
+              {ccProblem && <small className="form-error">{ccProblem}</small>}
             </label>
 
             <label className="field">
-              <span>Their email</span>
+              <span>Recipient's Email</span>
               <input
-                ref={ccEmail ? firstEmpty : null}
+                ref={ccList.length ? firstEmpty : null}
                 type="email"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
@@ -162,7 +232,7 @@ export default function NotifyModal({ item, adminName, onClose, onNotified }) {
               <button type="button" className="btn btn--ghost" onClick={onClose}>
                 Cancel
               </button>
-              <button className="btn btn--escalate-solid" disabled={busy || !email || !ccEmail}>
+              <button className="btn btn--escalate-solid" disabled={busy || !email || ccList.length === 0}>
                 {busy ? 'Sending…' : 'Send notification'}
               </button>
             </div>

@@ -64,6 +64,7 @@ export const api = {
   respond: (id, status, comment) => request(`/items/${id}/respond`, { method: 'POST', body: { status, comment } }),
   setStatus: (id, status) => request(`/items/${id}/status`, { method: 'PATCH', body: { status } }),
   deleteItem: (id) => request(`/items/${id}`, { method: 'DELETE' }),
+  deleteComment: (itemId, commentId) => request(`/items/${itemId}/comments/${commentId}`, { method: 'DELETE' }),
   setCategory: (id, category) => request(`/items/${id}/category`, { method: 'PATCH', body: { category } }),
   notify: (itemId, email, ccEmail, note) => request('/escalate', { method: 'POST', body: { itemId, email, ccEmail, note } }),
   // quick = the automatic background check; the Sync button does a full sweep.

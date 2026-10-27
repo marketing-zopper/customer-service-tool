@@ -22,6 +22,13 @@ const DETAIL_COLUMNS = `${LIST_COLUMNS},body_full`;
 const COMMENT_COLUMNS = 'id,author,author_role,body,status_set,created_at';
 const COMMENT_MAX = 2000;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const CC_MAX = 10;
+
+/** One address, several separated by commas, semicolons or spaces, or a list: cleaned, lower-cased, no repeats. */
+function parseEmails(value) {
+  const parts = [].concat(value ?? []).flatMap((entry) => String(entry).split(/[\s,;]+/));
+  return [...new Set(parts.map((part) => part.trim().toLowerCase()).filter(Boolean))];
+}
 
 async function getItem(id, columns = LIST_COLUMNS) {
   const item = unwrap(await db().from('mail_items').select(`${columns},is_lead`).eq('id', id).maybeSingle());
@@ -30,6 +37,43 @@ async function getItem(id, columns = LIST_COLUMNS) {
 }
 
 const stripInternal = ({ is_lead, ...item }) => item;
+
+/** Who this request writes comments as: a team member's name, or the email the shared link was sent to. */
+const commenter = (auth) =>
+  auth.kind === 'admin' ? { author: auth.name, role: 'team' } : { author: auth.link.recipient_email || 'Responder', role: 'responder' };
+
+/** A comment can be deleted only by the person who wrote it, and only if it has text (status-only entries are a record). */
+const isOwnComment = (comment, auth) => {
+  const me = commenter(auth);
+  return comment.body != null && comment.author === me.author && comment.author_role === me.role;
+};
+
+/**
+ * Adds `latest_comment` (who, when, what) to each item that has a written comment, for the
+ * Comments column. Ids go to the database in small groups so the request address stays short.
+ */
+async function withLatestComments(items) {
+  const wanted = items.filter((item) => item.comment_count > 0).map((item) => item.id);
+  const latest = new Map();
+  for (let start = 0; start < wanted.length; start += 50) {
+    const rows = unwrap(
+      await db()
+        .from('item_comments')
+        .select('mail_item_id,author,author_role,body,created_at')
+        .in('mail_item_id', wanted.slice(start, start + 50))
+        .not('body', 'is', null),
+    );
+    for (const row of rows) {
+      const seen = latest.get(row.mail_item_id);
+      if (!seen || row.created_at > seen.created_at) latest.set(row.mail_item_id, row);
+    }
+  }
+  // null (not missing) when there is none, so a client merging this over an older copy clears a deleted comment
+  return items.map((item) => {
+    const row = latest.get(item.id);
+    return { ...item, latest_comment: row ? { author: row.author, author_role: row.author_role, body: row.body, created_at: row.created_at } : null };
+  });
+}
 
 // ---- Handlers -------------------------------------------------------------
 
@@ -95,7 +139,7 @@ const handlers = {
     }
     // Optional search box; every word must match (see lib/search.js).
     for (const filter of searchFilters(url.searchParams.get('q'))) query = query.or(filter);
-    const items = unwrap(await query);
+    const items = await withLatestComments(unwrap(await query));
 
     if (auth.kind !== 'admin') return { items };
     const { count } = await db()
@@ -131,7 +175,28 @@ const handlers = {
     const comments = unwrap(
       await db().from('item_comments').select(COMMENT_COLUMNS).eq('mail_item_id', item.id).order('created_at', { ascending: true }),
     );
-    return { item: stripInternal(item), comments };
+    return { item: stripInternal(item), comments: comments.map((comment) => ({ ...comment, can_delete: isOwnComment(comment, auth) })) };
+  },
+
+  // Remove one of your own comments (not someone else's, and not a status-only entry).
+  async deleteComment({ auth, params }) {
+    const item = await getItem(params.id);
+    requireItemScope(auth, item.category, item.id);
+    const comment = unwrap(
+      await db().from('item_comments').select(COMMENT_COLUMNS).eq('id', params.commentId).eq('mail_item_id', item.id).maybeSingle(),
+    );
+    if (!comment) throw new HttpError(404, 'Comment not found');
+    if (comment.body == null) throw new HttpError(409, "Status updates can't be deleted");
+    if (!isOwnComment(comment, auth)) throw new HttpError(403, 'You can only delete your own comments');
+
+    const me = commenter(auth);
+    const removed = unwrap(
+      await db().rpc('delete_item_comment', { p_item: item.id, p_comment: comment.id, p_author: me.author, p_role: me.role }),
+    );
+    if (!removed) throw new HttpError(404, 'Comment not found');
+    const updated = unwrap(await db().from('mail_items').select(LIST_COLUMNS).eq('id', item.id).single());
+    const [withComment] = await withLatestComments([updated]);
+    return { item: withComment };
   },
 
   // The reply from whoever a query was escalated to: a new status, a comment, or both in one go, so
@@ -153,14 +218,15 @@ const handlers = {
     const saved = unwrap(
       await db().rpc('respond_to_item', {
         p_item: item.id,
-        p_author: auth.kind === 'admin' ? auth.name : auth.link.recipient_email || 'Responder',
-        p_role: auth.kind === 'admin' ? 'team' : 'responder',
+        p_author: commenter(auth).author,
+        p_role: commenter(auth).role,
         p_body: text || null,
         p_status: statusChanged ? status : null,
       }),
     );
     const updated = unwrap(await db().from('mail_items').select(LIST_COLUMNS).eq('id', item.id).single());
-    return { item: updated, comment: saved };
+    const [withComment] = await withLatestComments([updated]);
+    return { item: withComment, comment: { ...saved, can_delete: saved.body != null } };
   },
 
   async updateStatus({ req, auth, params }) {
@@ -211,8 +277,11 @@ const handlers = {
     const { itemId, email, ccEmail, note } = await readJson(req);
     const recipient = String(email || '').trim().toLowerCase();
     if (!EMAIL_RE.test(recipient) || recipient.length > 254) throw new HttpError(400, 'Enter a valid email address for the person to notify');
-    const cc = String(ccEmail || '').trim().toLowerCase();
-    if (!EMAIL_RE.test(cc) || cc.length > 254) throw new HttpError(400, 'Enter your own email address. You will be copied on the notification');
+    const ccList = parseEmails(ccEmail);
+    if (ccList.length === 0) throw new HttpError(400, 'Enter at least one CC email address (your own). Everyone listed is copied on the notification');
+    if (ccList.length > CC_MAX) throw new HttpError(400, `You can copy up to ${CC_MAX} email addresses`);
+    const badCc = ccList.find((address) => !EMAIL_RE.test(address) || address.length > 254);
+    if (badCc) throw new HttpError(400, `"${badCc.slice(0, 60)}" is not a valid CC email address`);
     const cleanNote = String(note || '').trim().slice(0, 1000);
 
     const item = await getItem(itemId, DETAIL_COLUMNS);
@@ -228,7 +297,7 @@ const handlers = {
         mail_item_id: item.id,
         recipient_email: recipient,
         expires_at: expiresAt,
-        created_by: `${auth.name} <${cc}>`,
+        created_by: `${auth.name} <${ccList.join(', ')}>`,
       }),
     );
 
@@ -237,7 +306,7 @@ const handlers = {
     let emailError = null;
     if (emailConfigured()) {
       try {
-        await sendNotificationEmail({ to: recipient, cc, item, url, notifiedBy: auth.name, note: cleanNote, expiresAt });
+        await sendNotificationEmail({ to: recipient, cc: ccList, item, url, notifiedBy: auth.name, note: cleanNote, expiresAt });
         emailSent = true;
       } catch (error) {
         console.error('[notify] email failed:', error.message);
@@ -257,7 +326,7 @@ const handlers = {
     );
 
     // The raw link is only handed back when the email did not go out, so the sender can share it by hand.
-    return { item: updated, emailSent, emailError, expiresAt, ccEmail: cc, ...(emailSent ? {} : { link: url }) };
+    return { item: updated, emailSent, emailError, expiresAt, ccEmail: ccList.join(', '), ccEmails: ccList, ...(emailSent ? {} : { link: url }) };
   },
 
   // Sync with Webflow. ?mode=quick is the dashboard's automatic check when it is opened (newest page
@@ -278,6 +347,7 @@ const routes = [
   ['GET', /^\/api\/items$/, handlers.listItems],
   ['GET', /^\/api\/items\/(?<id>[0-9a-f-]{36})$/, handlers.getItem],
   ['DELETE', /^\/api\/items\/(?<id>[0-9a-f-]{36})$/, handlers.deleteItem],
+  ['DELETE', /^\/api\/items\/(?<id>[0-9a-f-]{36})\/comments\/(?<commentId>[0-9a-f-]{36})$/, handlers.deleteComment],
   ['PATCH', /^\/api\/items\/(?<id>[0-9a-f-]{36})\/archive$/, handlers.setArchived],
   ['PATCH', /^\/api\/items\/(?<id>[0-9a-f-]{36})\/status$/, handlers.updateStatus],
   ['POST', /^\/api\/items\/(?<id>[0-9a-f-]{36})\/respond$/, handlers.respond],

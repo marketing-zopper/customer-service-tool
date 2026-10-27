@@ -65,13 +65,14 @@ function fakeSupabase(url, init) {
   const table = u.pathname.split('/').pop();
   const method = init?.method || 'GET';
   const wantsObject = String(init?.headers?.Accept || init?.headers?.get?.('Accept') || '').includes('vnd.pgrst.object');
-  const filters = [...u.searchParams].filter(([, v]) => v.startsWith('eq.') || v === 'is.null' || v === 'not.is.null');
+  const filters = [...u.searchParams].filter(([, v]) => v.startsWith('eq.') || v.startsWith('in.(') || v === 'is.null' || v === 'not.is.null');
   const ors = u.searchParams.getAll('or');
   const matches = (row) =>
     ors.every((param) => matchesOr(row, param)) &&
     filters.every(([k, v]) => {
       if (v === 'is.null') return row[k] == null;
       if (v === 'not.is.null') return row[k] != null;
+      if (v.startsWith('in.(')) return v.slice(4, -1).split(',').includes(String(row[k]));
       return String(row[k]) === v.slice(3);
     });
   const rows = tables[table] || [];
@@ -94,6 +95,20 @@ function fakeSupabase(url, init) {
     if (p.p_status) item.status = p.p_status;
     if (p.p_body !== null) item.comment_count += 1;
     return new Response(JSON.stringify(comment), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+
+  // the atomic delete: only the author's own text comment goes, and the count follows
+  if (method === 'POST' && table === 'delete_item_comment') {
+    const p = JSON.parse(init.body);
+    const at = tables.item_comments.findIndex(
+      (c) => c.id === p.p_comment && c.mail_item_id === p.p_item && c.author === p.p_author && c.author_role === p.p_role && c.body != null,
+    );
+    if (at !== -1) {
+      tables.item_comments.splice(at, 1);
+      const item = tables.mail_items.find((i) => i.id === p.p_item);
+      item.comment_count = Math.max(item.comment_count - 1, 0);
+    }
+    return new Response(JSON.stringify(at !== -1), { status: 200, headers: { 'content-type': 'application/json' } });
   }
 
   if (method === 'POST') {
@@ -260,6 +275,8 @@ test('notify: admin-only, needs both emails, stores a hashed link, marks the ite
   assert.equal((await send({ itemId: ITEM_C, email: 'boss@zopper.com' })).status, 400);
   assert.equal((await send({ ...body, ccEmail: '' })).status, 400);
   assert.equal((await send({ ...body, ccEmail: 'nope' })).status, 400);
+  assert.equal((await send({ ...body, ccEmail: 'me@zopper.com, nope' })).status, 400); // every address is checked
+  assert.equal((await send({ ...body, ccEmail: Array.from({ length: 11 }, (_, i) => `p${i}@zopper.com`) })).status, 400); // up to 10
 
   const before = tables.magic_links.length;
   const done = await send(body);
@@ -312,6 +329,26 @@ test('notify sends the full details to the recipient, copies and sets reply-to t
     assert.deepEqual(mail.to, ['boss@zopper.com']);
     assert.deepEqual(mail.cc, ['me@zopper.com']);
     assert.equal(mail.reply_to, 'me@zopper.com');
+
+    // several CC addresses: separators of any kind, repeats and capitals tidied, the recipient not copied on their own mail
+    sentEmails.length = 0;
+    const many = await call('/api/escalate', {
+      method: 'POST',
+      body: { itemId: ITEM_C, email: 'boss@zopper.com', ccEmail: 'Me@zopper.com; lead@zopper.com,  ME@zopper.com\nboss@zopper.com' },
+      cookie,
+    });
+    assert.equal(many.status, 200);
+    assert.deepEqual(many.data.ccEmails, ['me@zopper.com', 'lead@zopper.com', 'boss@zopper.com']);
+    assert.deepEqual(sentEmails[0].cc, ['me@zopper.com', 'lead@zopper.com']);
+    assert.deepEqual(sentEmails[0].reply_to, ['me@zopper.com', 'lead@zopper.com', 'boss@zopper.com']);
+    assert.ok(sentEmails[0].text.includes('Also copied: lead@zopper.com, boss@zopper.com.'));
+    assert.equal(tables.magic_links.at(-1).created_by, 'Arpit Jain <me@zopper.com, lead@zopper.com, boss@zopper.com>');
+    // an array works too
+    sentEmails.length = 0;
+    await call('/api/escalate', { method: 'POST', body: { itemId: ITEM_C, email: 'boss@zopper.com', ccEmail: ['me@zopper.com', 'x@zopper.com'] }, cookie });
+    assert.deepEqual(sentEmails[0].cc, ['me@zopper.com', 'x@zopper.com']);
+    sentEmails.length = 0;
+    await call('/api/escalate', { method: 'POST', body: { itemId: ITEM_C, email: 'Boss@zopper.com', ccEmail: 'me@zopper.com', note: 'Please call today' }, cookie });
     assert.match(mail.subject, /^\[Complaint \/ Enquiry\]/);
     for (const part of [mail.html, mail.text]) {
       assert.ok(part.includes('Second paragraph'));
@@ -493,12 +530,52 @@ test('respond: the person a query was escalated to saves a status and a comment 
   ]);
   const list = await call('/api/items?category=complaint_enquiry', { token: link });
   assert.equal(list.data.items[0].comment_count, 2);
+  // the list also carries the latest written comment (for the Comments column), never a status-only update
+  assert.equal(list.data.items[0].latest_comment.body, 'Customer confirmed.');
+  assert.equal(list.data.items[0].latest_comment.author_role, 'responder');
 
   // the marketing team sees the same thread, and can add to it under their own name
   const cookie = await adminCookie();
   assert.equal((await call(`/api/items/${ITEM_C}`, { cookie })).data.comments.length, 3);
   const team = await respond(ITEM_C, { comment: 'Thanks, closing this.' }, { cookie });
   assert.deepEqual([team.data.comment.author, team.data.comment.author_role], ['Arpit Jain', 'team']);
+  assert.equal(team.data.item.latest_comment.body, 'Thanks, closing this.');
+
+  // deleting: only your own comments, never someone else's, and never a status-only entry
+  const remove = (itemId, commentId, opts) => call(`/api/items/${itemId}/comments/${commentId}`, { method: 'DELETE', ...opts });
+  const thread = async (opts) => (await call(`/api/items/${ITEM_C}`, opts)).data.comments;
+  const before = await thread({ cookie });
+  const byId = (text) => before.find((c) => c.body === text);
+  const mine = byId('Thanks, closing this.'); // written by Arpit Jain (team)
+  const theirs = byId('Customer confirmed.'); // written by the link's recipient (responder)
+  const statusEntry = before.find((c) => c.body === null);
+  assert.deepEqual(before.map((c) => [c.body, c.can_delete]), [
+    ['Refund issued today.', false],
+    ['Customer confirmed.', false],
+    [null, false],
+    ['Thanks, closing this.', true],
+  ]); // the team member may delete only the one they wrote
+  assert.equal((await thread({ token: link })).filter((c) => c.can_delete).length, 2); // the responder: their own two, not the team's
+
+  assert.equal((await remove(ITEM_C, mine.id)).status, 401); // anonymous
+  assert.equal((await remove(ITEM_C, theirs.id, { cookie })).status, 403); // a team member can't delete the responder's
+  assert.equal((await remove(ITEM_C, mine.id, { token: link })).status, 403); // the responder can't delete the team's
+  const otherAdmin = (await call('/api/login', { method: 'POST', body: { name: 'Farman Khan', password: 'correct horse' } })).cookie.split(';')[0];
+  assert.equal((await remove(ITEM_C, mine.id, { cookie: otherAdmin })).status, 403); // nor can another team member
+  assert.equal((await remove(ITEM_C, statusEntry.id, { token: link })).status, 409); // status entries stay
+  assert.equal((await remove(ITEM_C2, mine.id, { cookie })).status, 404); // right id, wrong item
+  assert.equal((await remove(ITEM_C, '99999999-9999-4999-9999-999999999999', { cookie })).status, 404);
+  assert.equal((await thread({ cookie })).length, 4); // none of the refusals changed anything
+
+  const gone = await remove(ITEM_C, mine.id, { cookie });
+  assert.equal(gone.status, 200);
+  assert.equal(gone.data.item.comment_count, 2);
+  assert.equal(gone.data.item.latest_comment.body, 'Customer confirmed.');
+  assert.equal((await thread({ cookie })).length, 3);
+  assert.equal((await remove(ITEM_C, mine.id, { cookie })).status, 404); // already gone
+  const own = await remove(ITEM_C, theirs.id, { token: link });
+  assert.equal(own.status, 200);
+  assert.equal(own.data.item.comment_count, 1);
 
   // an item nobody has commented on has an empty thread, and markup is stored as plain text
   assert.deepEqual((await call(`/api/items/${ITEM_C2}`, { cookie })).data.comments, []);
