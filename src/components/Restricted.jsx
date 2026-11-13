@@ -1,6 +1,6 @@
 import { LockKeyhole } from 'lucide-react';
 
-export default function Restricted({ title, message, onRetry, offerSignIn }) {
+export default function Restricted({ title, message, onRetry, offerSignIn, signInLabel = 'Marketing team sign in' }) {
   return (
     <main className="center-screen">
       <div className="panel panel--narrow">
@@ -18,7 +18,7 @@ export default function Restricted({ title, message, onRetry, offerSignIn }) {
           )}
           {offerSignIn && (
             <button className="btn btn--ghost" onClick={offerSignIn}>
-              Marketing team sign in
+              {signInLabel}
             </button>
           )}
         </div>

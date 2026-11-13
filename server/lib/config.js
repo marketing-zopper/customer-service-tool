@@ -27,3 +27,10 @@ export function envInt(name, fallback) {
 export function appUrl() {
   return env('APP_URL', 'http://localhost:5173').replace(/\/+$/, '');
 }
+
+/**
+ * 'legacy': the shared marketing password and magic links (how the app has always worked).
+ * 'google': Google sign-in plus the central Upstash employee check; password and magic links are refused.
+ * Switching back is just changing this variable, so the new sign-in can be rolled back instantly.
+ */
+export const authMode = () => (env('AUTH_MODE', 'legacy') === 'google' ? 'google' : 'legacy');

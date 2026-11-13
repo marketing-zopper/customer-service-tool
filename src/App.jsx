@@ -16,7 +16,10 @@ function Redirect({ to }) {
 function Shell() {
   const { section } = useParams();
   const [params] = useSearchParams();
-  const token = params.get('token');
+  const token = params.get('token'); // legacy magic links only
+  const caseId = params.get('case'); // an email link to one case: it only points there, it never signs anyone in
+  const authNotice = params.get('auth');
+  const [signedOut, setSignedOut] = useState(false);
   const [session, setSession] = useState(null);
   const [loadError, setLoadError] = useState(null);
 
@@ -34,7 +37,8 @@ function Shell() {
 
   const signOut = async () => {
     await api.logout().catch(() => {});
-    setSession({ role: 'anon' });
+    setSignedOut(true); // don't bounce straight back through Google
+    setSession({ role: 'anon', ...(session?.authMode ? { authMode: session.authMode } : {}) });
   };
 
   if (!SECTIONS[section]) return <Redirect to="/dashboard/partnership" />;
@@ -43,7 +47,21 @@ function Shell() {
 
   switch (session.role) {
     case 'admin':
-      return <Dashboard session={session} sectionKey={section} onSignOut={signOut} />;
+    case 'user':
+      return <Dashboard session={session} sectionKey={section} onSignOut={signOut} caseId={caseId} />;
+    case 'denied':
+      return (
+        <Restricted
+          title="You don't have access to Service Triage"
+          message={`${session.email} isn't set up for Service Triage, or its access has been turned off. Ask your admin to assign you a role, then try again.`}
+          onRetry={loadSession}
+          signInLabel="Use a different Google account"
+          offerSignIn={async () => {
+            await api.logout().catch(() => {});
+            window.location.assign(`/api/auth/google?switch=1&next=${encodeURIComponent(window.location.pathname + window.location.search)}`);
+          }}
+        />
+      );
     case 'link':
       // A link only ever unlocks its own section.
       if (session.section !== section) return <Redirect to={`/dashboard/${session.section}`} />;
@@ -57,7 +75,7 @@ function Shell() {
         />
       );
     default:
-      return <Gate onSignedIn={setSession} />;
+      return <Gate onSignedIn={setSession} authMode={session.authMode} notice={authNotice} auto={!signedOut} />;
   }
 }
 

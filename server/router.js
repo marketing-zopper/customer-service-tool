@@ -1,17 +1,26 @@
-import { CATEGORIES, SECTION_SLUGS, STATUSES, envInt } from './lib/config.js';
-import { HttpError, readJson, sendJson } from './lib/http.js';
+import { CATEGORIES, SECTION_SLUGS, STATUSES, appUrl, authMode, envInt } from './lib/config.js';
+import { HttpError, readJson, redirect, sendJson } from './lib/http.js';
 import { db, unwrap } from './lib/supabase.js';
 import {
   authenticate,
   checkAdminPassword,
+  clearOauthCookie,
   clearSessionCookie,
+  can,
+  clearUserCookie,
   hashToken,
   newToken,
-  requireAdmin,
+  oauthCookie,
+  permissionsOf,
+  readOauthCookie,
   requireAny,
   requireItemScope,
+  requirePermission,
   sessionCookie,
+  userSessionCookie,
 } from './lib/auth.js';
+import { accessFor } from './lib/employees.js';
+import { authorizeUrl, identityFromCode, newPkce } from './lib/google.js';
 import { emailConfigured, magicLinkUrl, sendNotificationEmail } from './lib/mail.js';
 import { runIngest } from './lib/ingest.js';
 import { searchFilters } from './lib/search.js';
@@ -38,9 +47,19 @@ async function getItem(id, columns = LIST_COLUMNS) {
 
 const stripInternal = ({ is_lead, ...item }) => item;
 
-/** Who this request writes comments as: a team member's name, or the email the shared link was sent to. */
-const commenter = (auth) =>
-  auth.kind === 'admin' ? { author: auth.name, role: 'team' } : { author: auth.link.recipient_email || 'Responder', role: 'responder' };
+/**
+ * Who this request writes comments as. A Google user is stored as "Name <email>" so that "delete your own
+ * comment" is tied to the verified email, not just a name two people could share. A legacy team member
+ * is their chosen name; a magic-link holder is the email the link was sent to.
+ */
+const commenter = (auth) => {
+  if (auth.kind === 'user') return { author: `${auth.name} <${auth.email}>`, role: 'team' };
+  if (auth.kind === 'admin') return { author: auth.name, role: 'team' };
+  return { author: auth.link.recipient_email || 'Responder', role: 'responder' };
+};
+
+/** What the screen shows as the author: the stored "Name <email>" without the email part. */
+const displayAuthor = (author) => String(author).replace(/\s*<[^<>]*>$/, '');
 
 /** A comment can be deleted only by the person who wrote it, and only if it has text (status-only entries are a record). */
 const isOwnComment = (comment, auth) => {
@@ -71,15 +90,35 @@ async function withLatestComments(items) {
   // null (not missing) when there is none, so a client merging this over an older copy clears a deleted comment
   return items.map((item) => {
     const row = latest.get(item.id);
-    return { ...item, latest_comment: row ? { author: row.author, author_role: row.author_role, body: row.body, created_at: row.created_at } : null };
+    return { ...item, latest_comment: row ? { author: displayAuthor(row.author), author_role: row.author_role, body: row.body, created_at: row.created_at } : null };
   });
 }
+
+const UUID_RE = /^[0-9a-f-]{36}$/;
+
+/** A link to a case that grants nothing by itself: the reader still has to sign in. */
+const caseLinkUrl = (item) => `${appUrl()}/dashboard/${SECTION_SLUGS[item.category]}?case=${item.id}`;
+
+// After Google sign-in we return to a page of this app, never to an address someone slipped into the link.
+const NEXT_RE = /^\/dashboard\/(partnership|complaints)(\?[A-Za-z0-9=&_%.-]*)?$/;
+const safeNext = (value) => (typeof value === 'string' && NEXT_RE.test(value) ? value : '/dashboard/partnership');
+
+const legacyOnly = () => {
+  if (authMode() === 'google') throw new HttpError(410, 'Password sign-in is turned off. Sign in with Google');
+};
+const googleOnly = () => {
+  if (authMode() !== 'google') throw new HttpError(404, 'Not found');
+};
 
 // ---- Handlers -------------------------------------------------------------
 
 const handlers = {
   async session({ auth }) {
     switch (auth.kind) {
+      case 'user':
+        return { role: 'user', authMode: 'google', name: auth.name, email: auth.email, access: auth.role, superAdmin: auth.superAdmin, can: permissionsOf(auth) };
+      case 'denied':
+        return { role: 'denied', authMode: 'google', email: auth.email };
       case 'admin':
         return { role: 'admin', name: auth.name };
       case 'link':
@@ -91,16 +130,18 @@ const handlers = {
           expiresAt: auth.link.expires_at,
         };
       default:
-        return { role: auth.kind };
+        return authMode() === 'google' ? { role: auth.kind, authMode: 'google' } : { role: auth.kind };
     }
   },
 
   async adminNames() {
+    legacyOnly();
     const rows = unwrap(await db().from('admin_names').select('name').order('name'));
     return { names: rows.map((row) => row.name) };
   },
 
   async login({ req, res }) {
+    legacyOnly();
     const { name, password } = await readJson(req);
     const rows = unwrap(await db().from('admin_names').select('name').eq('name', String(name || '')));
     const valid = rows.length === 1 && checkAdminPassword(password);
@@ -117,23 +158,72 @@ const handlers = {
     return { ok: true };
   },
 
+  // ---- Google sign-in (AUTH_MODE=google) ----
+
+  // Step 1: send the browser to Google (through Supabase Auth). If they already have a Google session
+  // in this browser, Google bounces straight back without asking for anything.
+  async authStart({ res, url }) {
+    googleOnly();
+    const { verifier, challenge } = newPkce();
+    res.setHeader('Set-Cookie', oauthCookie({ v: verifier, next: safeNext(url.searchParams.get('next')) }));
+    redirect(res, authorizeUrl(challenge, { chooseAccount: url.searchParams.get('switch') === '1' }));
+  },
+
+  // Step 2: Google sent them back with a one-time code. Verify who they are, ask Upstash what they may
+  // do, and only then give them a session. Anyone not allowed gets no session at all.
+  async authCallback({ req, res, url }) {
+    googleOnly();
+    const stash = readOauthCookie(req);
+    const leave = (to, cookies = []) => {
+      res.setHeader('Set-Cookie', [clearOauthCookie(), ...cookies]);
+      redirect(res, to);
+    };
+    const back = (reason) => leave(`/dashboard/partnership?auth=${reason}`, [clearUserCookie()]);
+
+    const code = url.searchParams.get('code');
+    if (!stash) return back('expired');
+    if (url.searchParams.get('error')) return back('cancelled');
+    if (!code) return back('failed');
+
+    let identity;
+    try {
+      identity = await identityFromCode(code, stash.v);
+    } catch (error) {
+      console.error('[auth] google sign-in failed:', error.message);
+      return back('failed');
+    }
+    let access;
+    try {
+      access = await accessFor(identity.email);
+    } catch {
+      return back('unavailable'); // couldn't ask Upstash: no access on a guess
+    }
+    if (!access.role) return back('denied');
+    leave(stash.next, [userSessionCookie(identity.email, access.name || identity.name)]);
+  },
+
   async listItems({ auth, url }) {
     const category = url.searchParams.get('category');
     if (!CATEGORIES.includes(category)) throw new HttpError(400, 'Unknown category');
     requireItemScope(auth, category);
+    requirePermission(auth, 'view');
     const archived = url.searchParams.get('archived') === '1';
-    if (archived) requireAdmin(auth);
+    if (archived && auth.kind === 'link') requirePermission(auth, 'manage'); // legacy link holders never see the archive; any signed-in role does
+    const caseId = url.searchParams.get('id'); // an email link to one case: just that case, wherever it is now
+    if (caseId !== null && !UUID_RE.test(caseId)) throw new HttpError(400, 'Unknown case');
 
     let query = db()
       .from('mail_items')
       .select(LIST_COLUMNS)
-      .eq('category', category)
       .eq('is_lead', false)
       .order('received_at', { ascending: false })
       .limit(300);
+    if (!caseId || auth.kind === 'link') query = query.eq('category', category);
     if (auth.kind === 'link' && auth.link.mail_item_id) {
       // Someone sent a link to one specific item: they see it even if it has since been archived.
       query = query.eq('id', auth.link.mail_item_id);
+    } else if (caseId) {
+      query = query.eq('id', caseId);
     } else {
       query = archived ? query.not('archived_at', 'is', null) : query.is('archived_at', null);
     }
@@ -141,7 +231,7 @@ const handlers = {
     for (const filter of searchFilters(url.searchParams.get('q'))) query = query.or(filter);
     const items = await withLatestComments(unwrap(await query));
 
-    if (auth.kind !== 'admin') return { items };
+    if (auth.kind === 'link') return { items };
     const { count } = await db()
       .from('mail_items')
       .select('id', { count: 'exact', head: true })
@@ -153,7 +243,7 @@ const handlers = {
 
   // Archive / restore: hides an item from the active list without touching its status.
   async setArchived({ req, auth, params }) {
-    requireAdmin(auth);
+    requirePermission(auth, 'manage');
     const { archived } = await readJson(req);
     if (typeof archived !== 'boolean') throw new HttpError(400, 'archived must be true or false');
     const item = await getItem(params.id);
@@ -172,16 +262,18 @@ const handlers = {
   async getItem({ auth, params }) {
     const item = await getItem(params.id, DETAIL_COLUMNS);
     requireItemScope(auth, item.category, item.id);
+    requirePermission(auth, 'view');
     const comments = unwrap(
       await db().from('item_comments').select(COMMENT_COLUMNS).eq('mail_item_id', item.id).order('created_at', { ascending: true }),
     );
-    return { item: stripInternal(item), comments: comments.map((comment) => ({ ...comment, can_delete: isOwnComment(comment, auth) })) };
+    return { item: stripInternal(item), comments: comments.map((comment) => ({ ...comment, can_delete: can(auth, 'comment') && isOwnComment(comment, auth), author: displayAuthor(comment.author) })) };
   },
 
   // Remove one of your own comments (not someone else's, and not a status-only entry).
   async deleteComment({ auth, params }) {
     const item = await getItem(params.id);
     requireItemScope(auth, item.category, item.id);
+    requirePermission(auth, 'comment');
     const comment = unwrap(
       await db().from('item_comments').select(COMMENT_COLUMNS).eq('id', params.commentId).eq('mail_item_id', item.id).maybeSingle(),
     );
@@ -208,6 +300,8 @@ const handlers = {
     requireItemScope(auth, item.category, item.id);
 
     const text = String(comment ?? '').trim();
+    if (text) requirePermission(auth, 'comment');
+    if (status && status !== item.status) requirePermission(auth, 'status');
     if (text.length > COMMENT_MAX) throw new HttpError(400, `Comments can be up to ${COMMENT_MAX} characters`);
     if (status && !STATUSES[item.category].includes(status)) throw new HttpError(400, `Invalid status for ${item.category}`);
     const statusChanged = Boolean(status) && status !== item.status;
@@ -226,13 +320,14 @@ const handlers = {
     );
     const updated = unwrap(await db().from('mail_items').select(LIST_COLUMNS).eq('id', item.id).single());
     const [withComment] = await withLatestComments([updated]);
-    return { item: withComment, comment: { ...saved, can_delete: saved.body != null } };
+    return { item: withComment, comment: { ...saved, author: displayAuthor(saved.author), can_delete: saved.body != null } };
   },
 
   async updateStatus({ req, auth, params }) {
     const { status } = await readJson(req);
     const item = await getItem(params.id);
     requireItemScope(auth, item.category, item.id);
+    requirePermission(auth, 'status');
     if (!STATUSES[item.category].includes(status)) throw new HttpError(400, `Invalid status for ${item.category}`);
 
     const updated = unwrap(
@@ -243,7 +338,7 @@ const handlers = {
 
   // Moves an item to the other tab (fixes a wrong guess by the rules).
   async setCategory({ req, auth, params }) {
-    requireAdmin(auth);
+    requirePermission(auth, 'manage');
     const { category } = await readJson(req);
     if (!CATEGORIES.includes(category)) throw new HttpError(400, 'Choose Partnership or Complaint / Enquiry');
     const item = await getItem(params.id);
@@ -259,7 +354,7 @@ const handlers = {
   // anything the rules couldn't place lands; Complaints can only be archived. The sync remembers the
   // id, so a deleted item never comes back.
   async deleteItem({ auth, params }) {
-    requireAdmin(auth);
+    requirePermission(auth, 'manage');
     const item = await getItem(params.id, `${LIST_COLUMNS},source_id`);
     if (item.category !== 'partnership') throw new HttpError(409, 'Only Partnership items can be deleted. Archive this one instead');
 
@@ -273,7 +368,7 @@ const handlers = {
   // "Notify": emails the concerned person a one-item magic link plus the full details of the query,
   // copying (and replying to) the employee who pressed the button.
   async escalate({ req, auth }) {
-    requireAdmin(auth);
+    requirePermission(auth, 'notify');
     const { itemId, email, ccEmail, note } = await readJson(req);
     const recipient = String(email || '').trim().toLowerCase();
     if (!EMAIL_RE.test(recipient) || recipient.length > 254) throw new HttpError(400, 'Enter a valid email address for the person to notify');
@@ -286,27 +381,38 @@ const handlers = {
 
     const item = await getItem(itemId, DETAIL_COLUMNS);
     if (item.archived_at) throw new HttpError(409, 'Restore this item from the archive before notifying about it');
-    const ttlDays = envInt('MAGIC_LINK_TTL_DAYS', 7);
-    const expiresAt = new Date(Date.now() + ttlDays * 86_400_000).toISOString();
-    const token = newToken();
-
-    unwrap(
-      await db().from('magic_links').insert({
-        token_hash: hashToken(token),
-        scope: item.category,
-        mail_item_id: item.id,
-        recipient_email: recipient,
-        expires_at: expiresAt,
-        created_by: `${auth.name} <${ccList.join(', ')}>`,
-      }),
-    );
-
-    const url = magicLinkUrl(item.category, token);
+    let url;
+    let expiresAt = null;
+    let recipientAccess = null;
+    if (authMode() === 'google') {
+      // The email only points at the case. Whoever opens it must sign in with Google and hold a role.
+      url = caseLinkUrl(item);
+      try {
+        recipientAccess = (await accessFor(recipient)).role || 'none';
+      } catch {
+        recipientAccess = null; // couldn't check; the email still goes out
+      }
+    } else {
+      const ttlDays = envInt('MAGIC_LINK_TTL_DAYS', 7);
+      expiresAt = new Date(Date.now() + ttlDays * 86_400_000).toISOString();
+      const token = newToken();
+      unwrap(
+        await db().from('magic_links').insert({
+          token_hash: hashToken(token),
+          scope: item.category,
+          mail_item_id: item.id,
+          recipient_email: recipient,
+          expires_at: expiresAt,
+          created_by: `${auth.name} <${ccList.join(', ')}>`,
+        }),
+      );
+      url = magicLinkUrl(item.category, token);
+    }
     let emailSent = false;
     let emailError = null;
     if (emailConfigured()) {
       try {
-        await sendNotificationEmail({ to: recipient, cc: ccList, item, url, notifiedBy: auth.name, note: cleanNote, expiresAt });
+        await sendNotificationEmail({ to: recipient, cc: ccList, item, url, notifiedBy: auth.name, note: cleanNote, expiresAt, signIn: authMode() === 'google' });
         emailSent = true;
       } catch (error) {
         console.error('[notify] email failed:', error.message);
@@ -326,13 +432,22 @@ const handlers = {
     );
 
     // The raw link is only handed back when the email did not go out, so the sender can share it by hand.
-    return { item: updated, emailSent, emailError, expiresAt, ccEmail: ccList.join(', '), ccEmails: ccList, ...(emailSent ? {} : { link: url }) };
+    return {
+      item: updated,
+      emailSent,
+      emailError,
+      expiresAt,
+      ccEmail: ccList.join(', '),
+      ccEmails: ccList,
+      ...(recipientAccess ? { recipientAccess } : {}),
+      ...(emailSent ? {} : { link: url }),
+    };
   },
 
   // Sync with Webflow. ?mode=quick is the dashboard's automatic check when it is opened (newest page
   // only); without it, the Sync button's full sweep. Only the marketing team can trigger either.
   async ingest({ auth, url }) {
-    requireAdmin(auth);
+    requirePermission(auth, 'sync');
     return runIngest({ quick: url.searchParams.get('mode') === 'quick' });
   },
 };
@@ -344,6 +459,8 @@ const routes = [
   ['GET', /^\/api\/admin-names$/, handlers.adminNames, { auth: 'none' }],
   ['POST', /^\/api\/login$/, handlers.login, { auth: 'none' }],
   ['POST', /^\/api\/logout$/, handlers.logout, { auth: 'none' }],
+  ['GET', /^\/api\/auth\/google$/, handlers.authStart, { auth: 'none' }],
+  ['GET', /^\/api\/auth\/callback$/, handlers.authCallback, { auth: 'none' }],
   ['GET', /^\/api\/items$/, handlers.listItems],
   ['GET', /^\/api\/items\/(?<id>[0-9a-f-]{36})$/, handlers.getItem],
   ['DELETE', /^\/api\/items\/(?<id>[0-9a-f-]{36})$/, handlers.deleteItem],
@@ -379,7 +496,8 @@ export async function handle(req, res) {
     const auth = mode === 'none' ? { kind: 'anon' } : await authenticate(req);
     if (mode === 'required') requireAny(auth);
 
-    sendJson(res, 200, await handler({ req, res, url, params, auth }));
+    const body = await handler({ req, res, url, params, auth });
+    if (!res.writableEnded) sendJson(res, 200, body);
   } catch (error) {
     if (error instanceof HttpError) return sendJson(res, error.status, { error: error.message });
     console.error('[api]', error);

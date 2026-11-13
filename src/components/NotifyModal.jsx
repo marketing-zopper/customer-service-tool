@@ -92,8 +92,12 @@ function EmailChips({ value, onChange, inputRef, onProblem }) {
   );
 }
 
-export default function NotifyModal({ item, adminName, onClose, onNotified }) {
-  const [ccList, setCcList] = useState(() => splitEmails(readSaved(adminName)).filter((a) => EMAIL_RE.test(a)));
+export default function NotifyModal({ item, adminName, defaultCc = '', signIn = false, onClose, onNotified }) {
+  // Their remembered CC list, or (first time) their own sign-in email.
+  const [ccList, setCcList] = useState(() => {
+    const saved = splitEmails(readSaved(adminName)).filter((a) => EMAIL_RE.test(a));
+    return saved.length ? saved : splitEmails(defaultCc).filter((a) => EMAIL_RE.test(a));
+  });
   const [ccProblem, setCcProblem] = useState('');
   const [email, setEmail] = useState(item.assigned_to || '');
   const [note, setNote] = useState('');
@@ -152,6 +156,11 @@ export default function NotifyModal({ item, adminName, onClose, onNotified }) {
               {result.emailSent ? <Check size={22} aria-hidden="true" /> : <TriangleAlert size={22} aria-hidden="true" />}
             </div>
             <h2 id="notify-title">{result.emailSent ? 'Notified' : 'Marked notified, but email not sent'}</h2>
+            {result.recipientAccess === 'none' && (
+              <p className="form-error" role="alert">
+                {email} has no Service Triage access yet, so they can't open the case. Ask an admin to assign them a role, or use the email's reply address to reach them.
+              </p>
+            )}
             {result.emailSent ? (
               <p className="muted">
                 The full details and a link to this item were emailed to <strong>{email}</strong>, with a copy to{' '}
@@ -218,8 +227,9 @@ export default function NotifyModal({ item, adminName, onClose, onNotified }) {
             </label>
 
             <p className="hint">
-              They'll get the complete details of this query plus a link that opens only this item and lets them update its
-              status. The link expires after a few days.
+              {signIn
+                ? "They'll get the complete details of this query plus a link to the case. They sign in with their Zopper Google account, and what they can do depends on their Service Triage role."
+                : "They'll get the complete details of this query plus a link that opens only this item and lets them update its status. The link expires after a few days."}
             </p>
 
             {error && (

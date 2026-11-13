@@ -35,9 +35,9 @@ function withContactDetails(body, item) {
 }
 
 /** One entry of the table. Everything an item card used to offer lives in this row. */
-export default function ItemRow({ index, item, statuses, canNotify, onStatusChange, onNotify, onMove, onDelete, onArchive, archived, readOnlyStatus = false, onCommentSaved, onItemChanged, showComments = false }) {
+export default function ItemRow({ index, item, statuses, canNotify, onStatusChange, onNotify, onMove, onDelete, onArchive, archived, readOnlyStatus = false, onCommentSaved, onItemChanged, showComments = false, startOpen = false }) {
   const [confirming, setConfirming] = useState(false);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(startOpen);
   const [body, setBody] = useState(null);
   const [bodyError, setBodyError] = useState('');
   const [comments, setComments] = useState([]);
@@ -63,6 +63,12 @@ export default function ItemRow({ index, item, statuses, canNotify, onStatusChan
       setBodyError(error.message);
     }
   }
+
+  // A case opened from an email link starts with its message and comments showing.
+  useEffect(() => {
+    if (startOpen) loadBody();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // When the item changes on the server (someone replied), refresh an open row's comments.
   const firstRender = useRef(true);
@@ -209,10 +215,12 @@ export default function ItemRow({ index, item, statuses, canNotify, onStatusChan
                 <MessageSquare size={12} aria-hidden="true" /> {item.comment_count} comment{item.comment_count === 1 ? '' : 's'}
               </span>
             </button>
-          ) : (
+          ) : onCommentSaved ? (
             <button className="link-btn peek-empty" onClick={openDetail}>
               <MessageSquare size={14} aria-hidden="true" /> Add a comment
             </button>
+          ) : (
+            <span className="muted peek-empty">No comments</span>
           )}
         </div>
       )}

@@ -53,7 +53,7 @@ function buildFacts(item) {
   return { facts, message: message || item.body_snippet || '' };
 }
 
-export function renderNotificationEmail({ item, url, notifiedBy, notifiedByEmail, note, expiresAt }) {
+export function renderNotificationEmail({ item, url, notifiedBy, notifiedByEmail, note, expiresAt, signIn = false }) {
   const label = CATEGORY_LABELS[item.category];
   const { facts, message } = buildFacts(item);
   const expiry = expiresAt
@@ -90,7 +90,7 @@ export function renderNotificationEmail({ item, url, notifiedBy, notifiedByEmail
           <p style="margin:0 0 6px;font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:#6B7280;">Message</p>
           <div style="margin:0 0 24px;font-size:14px;line-height:1.65;color:#111827;white-space:pre-wrap;overflow-wrap:anywhere;border-left:3px solid #19B4EA;background:#F6F7FA;border-radius:0 8px 8px 0;padding:14px 16px;">${escapeHtml(message || '(no message text)')}</div>
           <a href="${url}" style="display:inline-block;background:#EE773D;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;padding:12px 24px;border-radius:8px;">Review this item</a>
-          <p style="margin:24px 0 0;font-size:12px;line-height:1.6;color:#6B7280;">This link opens only this item and lets you set its status and leave a comment for the team. Please don't forward it.${expiry ? ` It expires on ${escapeHtml(expiry)}.` : ''} Reply to this email to reach ${escapeHtml(notifiedBy)}.</p>
+          <p style="margin:24px 0 0;font-size:12px;line-height:1.6;color:#6B7280;">${signIn ? 'This link only takes you to the case: sign in with your Zopper Google account to open it. What you can do there depends on your Service Triage access.' : `This link opens only this item and lets you set its status and leave a comment for the team. Please don't forward it.${expiry ? ` It expires on ${escapeHtml(expiry)}.` : ''}`} Reply to this email to reach ${escapeHtml(notifiedBy)}.</p>
         </td></tr>
       </table>
     </td></tr>
@@ -109,7 +109,7 @@ export function renderNotificationEmail({ item, url, notifiedBy, notifiedByEmail
     message || '(no message text)',
     '',
     `Review this item: ${url}`,
-    expiry ? `Link expires on ${expiry}.` : '',
+    signIn ? 'Sign in with your Zopper Google account to open this case.' : expiry ? `Link expires on ${expiry}.` : '',
     `Reply to this email to reach ${notifiedBy}.`,
   ]
     .filter((line, index, all) => line !== '' || all[index - 1] !== '')
@@ -122,9 +122,9 @@ export function renderNotificationEmail({ item, url, notifiedBy, notifiedByEmail
  * Sends the notification through Resend. `cc` is one address or a list, the first being the employee
  * who pressed Notify; replies go to all of them, since the message itself is sent from a shared address. Throws on failure.
  */
-export async function sendNotificationEmail({ to, cc, item, url, notifiedBy, note, expiresAt }) {
+export async function sendNotificationEmail({ to, cc, item, url, notifiedBy, note, expiresAt, signIn = false }) {
   const ccList = [].concat(cc).filter(Boolean);
-  const { html, text } = renderNotificationEmail({ item, url, notifiedBy, notifiedByEmail: ccList, note, expiresAt });
+  const { html, text } = renderNotificationEmail({ item, url, notifiedBy, notifiedByEmail: ccList, note, expiresAt, signIn });
   // Anyone who is also the recipient doesn't need a copy.
   const copies = ccList.filter((address) => address.toLowerCase() !== to.toLowerCase());
   const response = await fetch('https://api.resend.com/emails', {

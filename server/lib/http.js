@@ -12,6 +12,14 @@ export function sendJson(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
+/** Answers with a redirect; the handler then returns nothing (the response is already finished). */
+export function redirect(res, location) {
+  res.statusCode = 302;
+  res.setHeader('Location', location);
+  res.setHeader('Cache-Control', 'no-store');
+  res.end();
+}
+
 // Vercel pre-parses JSON bodies into req.body; the local dev server does not.
 export async function readJson(req) {
   if (req.body !== undefined && req.body !== null) {

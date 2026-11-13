@@ -1,10 +1,14 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { HttpError, parseCookies } from './http.js';
 import { db, unwrap } from './supabase.js';
-import { env } from './config.js';
+import { authMode, env, envInt } from './config.js';
+import { accessFor } from './employees.js';
 
-const COOKIE_NAME = 'zs_session';
+const COOKIE_NAME = 'zs_session'; // legacy shared-password session
+const USER_COOKIE = 'zs_user'; // Google session (a different name, so neither mode can read the other's cookie)
+const OAUTH_COOKIE = 'zs_oauth'; // lives only while someone is at Google
 const SESSION_DAYS = 30;
+const OAUTH_MINUTES = 10;
 
 const sha256 = (value) => createHash('sha256').update(value).digest();
 
@@ -30,48 +34,79 @@ export function constantTimeMatch(candidate, expected) {
   return typeof candidate === 'string' && typeof expected === 'string' && safeEqual(candidate, expected);
 }
 
-// ---- Admin session: signed, httpOnly cookie carrying the chosen name ----
+// ---- Signed cookies. `context` keeps a signature made for one purpose from being replayed as another ----
 
-function sign(payload) {
-  return createHmac('sha256', sessionSecret()).update(payload).digest('base64url');
+function sign(payload, context = '') {
+  return createHmac('sha256', sessionSecret()).update(context + payload).digest('base64url');
 }
 
-export function sessionCookie(name) {
-  const exp = Date.now() + SESSION_DAYS * 86_400_000;
-  const payload = Buffer.from(JSON.stringify({ n: name, exp })).toString('base64url');
-  return serializeCookie(`${payload}.${sign(payload)}`, SESSION_DAYS * 86_400);
-}
-
-export function clearSessionCookie() {
-  return serializeCookie('', 0);
-}
-
-function serializeCookie(value, maxAgeSeconds) {
+function serializeCookie(name, value, maxAgeSeconds) {
   const secure = env('NODE_ENV', '') === 'production' || process.env.VERCEL ? '; Secure' : '';
-  return `${COOKIE_NAME}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${secure}`;
+  return `${name}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${secure}`;
 }
 
-function readSession(req) {
-  const raw = parseCookies(req.headers.cookie)[COOKIE_NAME];
+function signedCookie(name, data, maxAgeSeconds, context) {
+  const payload = Buffer.from(JSON.stringify({ ...data, exp: Date.now() + maxAgeSeconds * 1000 })).toString('base64url');
+  return serializeCookie(name, `${payload}.${sign(payload, context)}`, maxAgeSeconds);
+}
+
+/** The data inside a signed, unexpired cookie of ours, or null. */
+function readSigned(req, name, context) {
+  const raw = parseCookies(req.headers.cookie)[name];
   if (!raw) return null;
   const [payload, signature] = raw.split('.');
   if (!payload || !signature) return null;
   let expected;
   try {
-    expected = sign(payload);
+    expected = sign(payload, context);
   } catch {
     return null;
   }
   if (!constantTimeMatch(signature, expected)) return null;
   try {
-    const { n, exp } = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-    return typeof n === 'string' && exp > Date.now() ? { name: n } : null;
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    return data && data.exp > Date.now() ? data : null;
   } catch {
     return null;
   }
 }
 
-// ---- Magic links ----
+// ---- Legacy admin session: signed, httpOnly cookie carrying the chosen name ----
+
+export function sessionCookie(name) {
+  return signedCookie(COOKIE_NAME, { n: name }, SESSION_DAYS * 86_400, '');
+}
+
+export const clearSessionCookie = () => [serializeCookie(COOKIE_NAME, '', 0), serializeCookie(USER_COOKIE, '', 0)];
+
+function readSession(req) {
+  const data = readSigned(req, COOKIE_NAME, '');
+  return data && typeof data.n === 'string' ? { name: data.n } : null;
+}
+
+// ---- Google session: who signed in with Google. What they may do is looked up fresh on every request ----
+
+export function userSessionCookie(email, name) {
+  return signedCookie(USER_COOKIE, { e: email, n: name }, envInt('SESSION_DAYS', 7) * 86_400, 'user.');
+}
+
+export const clearUserCookie = () => serializeCookie(USER_COOKIE, '', 0);
+
+function readUserSession(req) {
+  const data = readSigned(req, USER_COOKIE, 'user.');
+  return data && typeof data.e === 'string' ? { email: data.e.toLowerCase(), name: typeof data.n === 'string' ? data.n : '' } : null;
+}
+
+// ---- The short-lived cookie that carries the PKCE secret and the page to return to while at Google ----
+
+export const oauthCookie = (data) => signedCookie(OAUTH_COOKIE, data, OAUTH_MINUTES * 60, 'oauth.');
+export const clearOauthCookie = () => serializeCookie(OAUTH_COOKIE, '', 0);
+export const readOauthCookie = (req) => {
+  const data = readSigned(req, OAUTH_COOKIE, 'oauth.');
+  return data && typeof data.v === 'string' ? data : null;
+};
+
+// ---- Magic links (legacy mode only) ----
 
 export const hashToken = (token) => sha256(token).toString('hex');
 
@@ -87,13 +122,29 @@ async function findLink(token) {
 }
 
 /**
- * Resolves who is calling:
+ * Resolves who is calling.
+ *
+ * google mode:
+ *   { kind: 'user', email, name, role, superAdmin }   signed in with Google and allowed by Upstash
+ *   { kind: 'denied', email }                         signed in, but no access (missing, inactive, no role)
+ *   { kind: 'anon' }                                  not signed in (magic-link headers are ignored)
+ *   Throws 503 if Upstash can't be asked: access is never granted on a guess.
+ *
+ * legacy mode:
  *   { kind: 'admin', name }   valid session cookie (any of the five marketing members)
  *   { kind: 'link', link }    valid, unexpired magic-link token (x-magic-token header)
  *   { kind: 'invalid' }       a token was sent but is unknown or expired
  *   { kind: 'anon' }          neither
  */
 export async function authenticate(req) {
+  if (authMode() === 'google') {
+    const session = readUserSession(req);
+    if (!session) return { kind: 'anon' };
+    const access = await accessFor(session.email);
+    if (!access.role) return { kind: 'denied', email: session.email };
+    return { kind: 'user', email: session.email, name: access.name || session.name || session.email, role: access.role, superAdmin: access.superAdmin };
+  }
+
   const session = readSession(req);
   if (session) return { kind: 'admin', name: session.name };
 
@@ -106,18 +157,50 @@ export async function authenticate(req) {
 }
 
 export function requireAny(auth) {
-  if (auth.kind === 'admin' || auth.kind === 'link') return;
+  if (auth.kind === 'admin' || auth.kind === 'link' || auth.kind === 'user') return;
+  if (auth.kind === 'denied') throw new HttpError(403, 'Your account does not have access to Service Triage');
   throw new HttpError(401, auth.kind === 'invalid' ? 'This link is invalid or has expired' : 'Sign in or use a valid link');
 }
 
-export function requireAdmin(auth) {
-  if (auth.kind !== 'admin') throw new HttpError(auth.kind === 'anon' ? 401 : 403, 'Marketing team access only');
+// ---- Permissions: the lowest role that may do each thing (Viewer < Editor < Admin) ----
+
+const RANK = { viewer: 1, editor: 2, admin: 3 };
+export const ACTIONS = {
+  view: 'viewer', // see and search cases and comments, including the archive
+  comment: 'editor', // add comments, delete your own
+  status: 'editor', // change a case's status
+  notify: 'editor', // send a notification email
+  sync: 'editor', // pull new Webflow submissions
+  manage: 'admin', // move between tabs, archive / restore, delete
+};
+
+/** Can this caller do `action`? (Item-level scope for link holders is checked separately, by requireItemScope.) */
+export function can(auth, action) {
+  switch (auth.kind) {
+    case 'admin':
+      return true; // legacy shared-password session: everything, as before
+    case 'user':
+      return RANK[auth.role] >= RANK[ACTIONS[action]];
+    case 'link':
+      return action === 'view' || action === 'comment' || action === 'status';
+    default:
+      return false;
+  }
+}
+
+export const permissionsOf = (auth) => Object.fromEntries(Object.keys(ACTIONS).map((action) => [action, can(auth, action)]));
+
+export function requirePermission(auth, action) {
+  requireAny(auth);
+  if (can(auth, action)) return;
+  if (auth.kind === 'user') throw new HttpError(403, `Your ${auth.role} role can't do this. It needs ${ACTIONS[action]} access`);
+  throw new HttpError(403, 'Marketing team access only');
 }
 
 /** Can this caller see/modify items of the given category (and, if given, this specific item)? */
 export function requireItemScope(auth, category, itemId) {
   requireAny(auth);
-  if (auth.kind === 'admin') return;
+  if (auth.kind === 'admin' || auth.kind === 'user') return;
   const { scope, mail_item_id: scopedItem } = auth.link;
   if (scope !== category || (scopedItem && itemId && scopedItem !== itemId)) {
     throw new HttpError(403, 'This link does not give access to that item');

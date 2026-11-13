@@ -3,13 +3,17 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { handle } from '../router.js';
+import { createHash } from 'node:crypto';
 import { hashToken } from '../lib/auth.js';
+import { clearAccessCache } from '../lib/employees.js';
 
 process.env.SUPABASE_URL = 'http://fake-supabase.test';
 process.env.SUPABASE_SERVICE_ROLE_KEY = 'service-role';
 process.env.ADMIN_PASSWORD = 'correct horse';
 process.env.SESSION_SECRET = 'x'.repeat(32);
 process.env.APP_URL = 'http://app.test';
+process.env.UPSTASH_REDIS_REST_URL = 'http://fake-redis.test';
+process.env.UPSTASH_REDIS_REST_TOKEN = 'redis-token';
 delete process.env.RESEND_API_KEY;
 
 const realFetch = globalThis.fetch;
@@ -141,12 +145,62 @@ function fakeSupabase(url, init) {
   });
 }
 
+// ---- Upstash: the employee hash, answering HGET only, remembering every command it was sent ----
+const employees = new Map();
+const redisCommands = [];
+let redisDown = false;
+function fakeRedis(init) {
+  const command = JSON.parse(init.body);
+  redisCommands.push(command);
+  if (redisDown) return new Response('{"error":"down"}', { status: 500 });
+  if (command[0] !== 'HGET' || command[1] !== 'zms:employees') return new Response('{"error":"unexpected"}', { status: 400 });
+  return new Response(JSON.stringify({ result: employees.get(command[2]) ?? null }), { status: 200 });
+}
+const employeeRecord = (email, role, extra = {}) =>
+  JSON.stringify({ email, name: 'Test Person', active: true, rbacVersion: 2, roles: { 'service-triage': role }, permissions: { 'service-triage': true }, ...extra });
+function setEmployee(email, role, extra) {
+  employees.set(email, typeof role === 'string' || role === undefined ? employeeRecord(email, role, extra) : JSON.stringify(role));
+  clearAccessCache();
+}
+
+// ---- Supabase Auth: Google sign-in as a PKCE flow (one-time codes, verifier checked against the challenge) ----
+const googleCodes = new Map();
+const googleTokens = new Map();
+function fakeAuth(href, init) {
+  const u = new URL(href);
+  const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  if (u.pathname === '/auth/v1/token') {
+    const { auth_code: code, code_verifier: verifier } = JSON.parse(init.body);
+    const entry = googleCodes.get(code);
+    const challenge = createHash('sha256').update(String(verifier)).digest('base64url');
+    if (!entry || entry.used || entry.challenge !== challenge) return json({ error: 'invalid_grant' }, 400);
+    entry.used = true;
+    const token = `jwt-${code}`;
+    googleTokens.set(token, entry.identity);
+    return json({ access_token: token, token_type: 'bearer' });
+  }
+  if (u.pathname === '/auth/v1/user') {
+    const identity = googleTokens.get(String(init.headers.Authorization || init.headers.authorization || '').replace('Bearer ', ''));
+    if (!identity) return json({ msg: 'invalid JWT' }, 401);
+    return json({
+      id: '00000000-0000-4000-a000-000000000001', aud: 'authenticated', email: identity.email, created_at: '2026-01-01T00:00:00Z',
+      app_metadata: { provider: identity.provider ?? 'google' }, user_metadata: { full_name: identity.name },
+      identities: identity.provider === 'email'
+        ? [{ provider: 'email', identity_data: { email: identity.email, email_verified: true } }]
+        : [{ provider: 'google', identity_data: { email: identity.email, email_verified: identity.verified } }],
+    });
+  }
+  return new Response(null, { status: 204 }); // logout
+}
+
 let server;
 let base;
 
 before(async () => {
   globalThis.fetch = (url, init) => {
     const href = String(url);
+    if (href === process.env.UPSTASH_REDIS_REST_URL) return Promise.resolve(fakeRedis(init));
+    if (href.startsWith(`${process.env.SUPABASE_URL}/auth/v1/`)) return Promise.resolve(fakeAuth(href, init));
     if (href.startsWith(process.env.SUPABASE_URL)) return Promise.resolve(fakeSupabase(href, init));
     if (href === 'https://api.resend.com/emails') {
       sentEmails.push(JSON.parse(init.body));
@@ -643,4 +697,389 @@ test('Vercel-style forwarded paths reach every route (nested paths, methods, que
 test('unknown routes and methods', async () => {
   assert.equal((await call('/api/nope')).status, 404);
   assert.equal((await call('/api/login')).status, 405);
+});
+
+// =====================================================================================================
+// Google sign-in + Upstash employee roles (AUTH_MODE=google)
+// =====================================================================================================
+
+const raw = async (path, { cookie, method = 'GET', body } = {}) => {
+  const response = await realFetch(base + path, {
+    method,
+    redirect: 'manual',
+    headers: { ...(cookie ? { cookie } : {}), ...(body ? { 'Content-Type': 'application/json' } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return { status: response.status, location: response.headers.get('location'), cookies: response.headers.getSetCookie() };
+};
+const cookieNamed = (cookies, name) => {
+  const pair = cookies.find((c) => c.startsWith(`${name}=`))?.split(';')[0];
+  return pair && pair !== `${name}=` ? pair : null;
+};
+
+let codeCounter = 0;
+/** Goes through the whole Google round trip as the given Google account. */
+async function signIn(email, { next, verified = true, provider, name = 'Test Person' } = {}) {
+  const start = await raw(`/api/auth/google${next ? `?next=${encodeURIComponent(next)}` : ''}`);
+  const oauth = cookieNamed(start.cookies, 'zs_oauth');
+  const code = `code-${(codeCounter += 1)}`;
+  googleCodes.set(code, { challenge: new URL(start.location).searchParams.get('code_challenge'), identity: { email, verified, name, provider }, used: false });
+  const done = await raw(`/api/auth/callback?code=${code}`, { cookie: oauth });
+  return { start, done, oauth, code, cookie: cookieNamed(done.cookies, 'zs_user') };
+}
+
+async function inGoogleMode(fn) {
+  process.env.AUTH_MODE = 'google';
+  employees.clear();
+  redisDown = false;
+  redisCommands.length = 0;
+  clearAccessCache();
+  resetDb();
+  try {
+    await fn();
+  } finally {
+    delete process.env.AUTH_MODE;
+  }
+}
+
+test('google mode: signed-out callers get nothing, and the old password and magic links are refused', async () => {
+  const legacyCookie = await adminCookie(); // a valid legacy session, made before switching modes
+  await inGoogleMode(async () => {
+    assert.deepEqual((await call('/api/session')).data, { role: 'anon', authMode: 'google' });
+    assert.equal((await call('/api/items?category=partnership')).status, 401);
+    assert.equal((await call('/api/login', { method: 'POST', body: { name: 'Arpit Jain', password: 'correct horse' } })).status, 410);
+    assert.equal((await call('/api/admin-names')).status, 410);
+    // a valid item magic link no longer opens anything, and neither does the old shared-password cookie
+    assert.equal((await call(`/api/items/${ITEM_C}`, { token: 'item-link-token-for-complaint-1' })).status, 401);
+    assert.equal((await call('/api/session', { cookie: legacyCookie })).data.role, 'anon');
+    assert.equal((await call('/api/items?category=partnership', { cookie: legacyCookie })).status, 401);
+  });
+});
+
+test('google mode: the legacy API still works exactly as before when AUTH_MODE is not google (rollback)', async () => {
+  resetDb();
+  assert.equal((await call('/api/auth/google')).status, 404); // the Google routes don't exist in legacy mode
+  assert.equal((await call('/api/admin-names')).status, 200);
+  const cookie = await adminCookie();
+  assert.equal((await call('/api/items?category=partnership', { cookie })).status, 200);
+  assert.equal((await call(`/api/items/${ITEM_C}`, { token: 'item-link-token-for-complaint-1' })).status, 200);
+});
+
+test('google sign-in: redirects to Supabase Auth with PKCE, then returns to the page that was asked for', async () => {
+  await inGoogleMode(async () => {
+    setEmployee('a@zopper.com', 'editor');
+    const start = await raw('/api/auth/google?next=%2Fdashboard%2Fcomplaints%3Fcase%3D' + ITEM_C);
+    assert.equal(start.status, 302);
+    const to = new URL(start.location);
+    assert.equal(`${to.origin}${to.pathname}`, 'http://fake-supabase.test/auth/v1/authorize');
+    assert.equal(to.searchParams.get('provider'), 'google');
+    assert.equal(to.searchParams.get('redirect_to'), 'http://app.test/api/auth/callback');
+    assert.equal(to.searchParams.get('code_challenge_method'), 's256');
+    assert.ok(to.searchParams.get('code_challenge'));
+    assert.equal(to.searchParams.get('prompt'), null); // reuse the browser's Google session silently
+    assert.match(start.cookies[0], /zs_oauth=.*HttpOnly/);
+    // the secret verifier never appears in the redirect
+    assert.ok(!start.location.includes('code_verifier'));
+    // "use a different account" asks Google for its account chooser
+    assert.equal(new URL((await raw('/api/auth/google?switch=1')).location).searchParams.get('prompt'), 'select_account');
+
+    const { done, cookie } = await signIn('a@zopper.com', { next: `/dashboard/complaints?case=${ITEM_C}` });
+    assert.equal(done.status, 302);
+    assert.equal(done.location, `/dashboard/complaints?case=${ITEM_C}`);
+    assert.match(done.cookies.find((c) => c.startsWith('zs_user=')), /HttpOnly; SameSite=Lax/);
+    assert.ok(cookie);
+    assert.equal(cookieNamed(done.cookies, 'zs_oauth'), null); // the one-time secret is cleared
+    const me = (await call('/api/session', { cookie })).data;
+    assert.equal(me.role, 'user');
+    assert.equal(me.access, 'editor');
+    assert.equal(me.email, 'a@zopper.com');
+    assert.equal(me.name, 'Test Person');
+  });
+});
+
+test('google sign-in: the return address can only be a page of this app', async () => {
+  await inGoogleMode(async () => {
+    setEmployee('a@zopper.com', 'viewer');
+    for (const next of ['https://evil.example/', '//evil.example', '/api/items', '/dashboard/partnership/../../x', 'javascript:alert(1)']) {
+      assert.equal((await signIn('a@zopper.com', { next })).done.location, '/dashboard/partnership', next);
+    }
+  });
+});
+
+test('google sign-in: no access unless Upstash says so (missing, inactive, no role, unknown role, switched off, unreadable)', async () => {
+  await inGoogleMode(async () => {
+    setEmployee('inactive@zopper.com', 'editor', { active: false });
+    setEmployee('norole@zopper.com', { email: 'norole@zopper.com', active: true, roles: {}, permissions: {} });
+    setEmployee('othertool@zopper.com', { email: 'othertool@zopper.com', active: true, roles: { 'design-request': 'admin' } });
+    setEmployee('weird@zopper.com', 'superuser'); // a role this app doesn't know
+    setEmployee('none@zopper.com', 'none');
+    setEmployee('off@zopper.com', 'admin', { permissions: { 'service-triage': false } });
+    setEmployee('stringactive@zopper.com', 'admin', { active: 'true' });
+    employees.set('broken@zopper.com', '{not json');
+    employees.set('array@zopper.com', '[1,2]');
+    setEmployee('mismatch@zopper.com', { email: 'someone-else@zopper.com', active: true, roles: { 'service-triage': 'admin' } });
+    for (const email of ['nobody@zopper.com', 'inactive', 'norole', 'othertool', 'weird', 'none', 'off', 'stringactive', 'broken', 'array', 'mismatch'].map((n) => (n.includes('@') ? n : `${n}@zopper.com`))) {
+      const { done, cookie } = await signIn(email);
+      assert.equal(done.location, '/dashboard/partnership?auth=denied', email);
+      assert.equal(cookie, null, `${email} must not get a session`);
+    }
+  });
+});
+
+test('google sign-in: Google problems end without a session', async () => {
+  await inGoogleMode(async () => {
+    setEmployee('a@zopper.com', 'admin');
+    // the Google email isn't verified
+    assert.equal((await signIn('a@zopper.com', { verified: false })).done.location, '/dashboard/partnership?auth=failed');
+    // a Supabase user that did not come from Google (no Google identity) is refused
+    assert.equal((await signIn('a@zopper.com', { provider: 'email' })).done.location, '/dashboard/partnership?auth=failed');
+    // opened without having started here, or with the secret missing
+    assert.equal((await raw('/api/auth/callback?code=whatever')).location, '/dashboard/partnership?auth=expired');
+    // the user pressed Cancel at Google
+    const start = await raw('/api/auth/google');
+    assert.equal((await raw('/api/auth/callback?error=access_denied', { cookie: cookieNamed(start.cookies, 'zs_oauth') })).location, '/dashboard/partnership?auth=cancelled');
+    // a made-up code
+    assert.equal((await raw('/api/auth/callback?code=forged', { cookie: cookieNamed(start.cookies, 'zs_oauth') })).location, '/dashboard/partnership?auth=failed');
+    // a code can be used once, and only by the browser that started the sign-in (PKCE)
+    const good = await signIn('a@zopper.com');
+    assert.ok(good.cookie);
+    assert.equal((await raw(`/api/auth/callback?code=${good.code}`, { cookie: good.oauth })).location, '/dashboard/partnership?auth=failed');
+    const first = await raw('/api/auth/google');
+    googleCodes.set('stolen', { challenge: new URL(first.location).searchParams.get('code_challenge'), identity: { email: 'a@zopper.com', verified: true, name: 'A' }, used: false });
+    const attacker = await raw('/api/auth/google'); // an attacker's own verifier does not match
+    assert.equal((await raw('/api/auth/callback?code=stolen', { cookie: cookieNamed(attacker.cookies, 'zs_oauth') })).location, '/dashboard/partnership?auth=failed');
+    // a tampered secret cookie
+    assert.equal((await raw('/api/auth/callback?code=x', { cookie: 'zs_oauth=eyJ2IjoieCIsImV4cCI6OTk5OTk5OTk5OTk5OX0.bad' })).location, '/dashboard/partnership?auth=expired');
+  });
+});
+
+test('google sign-in: if Upstash cannot be asked, nobody is let in (and nothing is granted on a guess)', async () => {
+  await inGoogleMode(async () => {
+    setEmployee('a@zopper.com', 'admin');
+    const { cookie } = await signIn('a@zopper.com');
+    assert.ok(cookie);
+    redisDown = true;
+    clearAccessCache();
+    const attempt = await signIn('a@zopper.com');
+    assert.equal(attempt.done.location, '/dashboard/partnership?auth=unavailable');
+    assert.equal(attempt.cookie, null);
+    // an already signed-in person is refused too, with "try again", not let through
+    const items = await call('/api/items?category=partnership', { cookie });
+    assert.equal(items.status, 503);
+    assert.equal((await call('/api/session', { cookie })).status, 503);
+    redisDown = false;
+    assert.equal((await call('/api/items?category=partnership', { cookie })).status, 200);
+  });
+});
+
+test('google mode: Upstash is only ever read (HGET on the employee hash), and without its settings access is denied', async () => {
+  await inGoogleMode(async () => {
+    setEmployee('a@zopper.com', 'admin');
+    const { cookie } = await signIn('a@zopper.com');
+    await call('/api/items?category=partnership', { cookie });
+    clearAccessCache();
+    await signIn('nobody@zopper.com');
+    assert.ok(redisCommands.length >= 2);
+    assert.ok(redisCommands.every((c) => c[0] === 'HGET' && c[1] === 'zms:employees'), JSON.stringify(redisCommands));
+    assert.ok(redisCommands.every((c) => c[2] === c[2].toLowerCase()));
+
+    const url = process.env.UPSTASH_REDIS_REST_URL;
+    delete process.env.UPSTASH_REDIS_REST_URL;
+    clearAccessCache();
+    try {
+      assert.equal((await call('/api/items?category=partnership', { cookie })).status, 503);
+    } finally {
+      process.env.UPSTASH_REDIS_REST_URL = url;
+    }
+  });
+});
+
+// What each role may do. [list, read, archive view, comment, status, notify, sync, move, archive, delete]
+async function whatCanTheyDo(cookie) {
+  const status = async (path, options = {}) => (await call(path, { ...options, cookie })).status;
+  return [
+    await status('/api/items?category=complaint_enquiry'),
+    await status(`/api/items/${ITEM_C}`),
+    await status('/api/items?category=complaint_enquiry&archived=1'),
+    await status(`/api/items/${ITEM_C}/respond`, { method: 'POST', body: { comment: 'a note' } }),
+    await status(`/api/items/${ITEM_C2}/status`, { method: 'PATCH', body: { status: 'in_review' } }),
+    await status('/api/escalate', { method: 'POST', body: { itemId: ITEM_C2, email: 'boss@zopper.com', ccEmail: 'me@zopper.com' } }),
+    await status('/api/ingest', { method: 'POST' }),
+    await status(`/api/items/${ITEM_C2}/category`, { method: 'PATCH', body: { category: 'partnership' } }),
+    await status(`/api/items/${ITEM_C2}/archive`, { method: 'PATCH', body: { archived: true } }),
+    await status(`/api/items/${ITEM_P}`, { method: 'DELETE' }),
+  ];
+}
+
+test('roles: Viewer, Editor, Admin and the Global Super Admin each get exactly their permissions from the API', async () => {
+  await inGoogleMode(async () => {
+    const rows = {
+      viewer: [200, 200, 200, 403, 403, 403, 403, 403, 403, 403],
+      editor: [200, 200, 200, 200, 200, 200, 200, 403, 403, 403],
+      admin: [200, 200, 200, 200, 200, 200, 200, 200, 200, 200],
+      superadmin: [200, 200, 200, 200, 200, 200, 200, 200, 200, 200],
+    };
+    for (const [role, expected] of Object.entries(rows)) {
+      resetDb();
+      const email = role === 'superadmin' ? 'marketingext@zopper.com' : `${role}@zopper.com`;
+      if (role !== 'superadmin') setEmployee(email, role); // the Super Admin has no Upstash record at all
+      const { cookie } = await signIn(email);
+      assert.ok(cookie, role);
+      assert.deepEqual(await whatCanTheyDo(cookie), expected, role);
+    }
+  });
+});
+
+test('roles: the session tells the screen what to show, and the Super Admin is only that one address', async () => {
+  await inGoogleMode(async () => {
+    setEmployee('viewer@zopper.com', 'viewer');
+    setEmployee('Marketingext@zopper.com'.toLowerCase(), 'viewer'); // a Redis record never lowers the Super Admin
+    const viewer = (await call('/api/session', { cookie: (await signIn('viewer@zopper.com')).cookie })).data;
+    assert.deepEqual(viewer.can, { view: true, comment: false, status: false, notify: false, sync: false, manage: false });
+    assert.equal(viewer.superAdmin, false);
+    const boss = (await call('/api/session', { cookie: (await signIn('marketingext@zopper.com')).cookie })).data;
+    assert.equal(boss.superAdmin, true);
+    assert.ok(Object.values(boss.can).every(Boolean));
+    // an "admin" role in Upstash is just Admin, not the Super Admin
+    setEmployee('admin@zopper.com', 'admin');
+    assert.equal((await call('/api/session', { cookie: (await signIn('admin@zopper.com')).cookie })).data.superAdmin, false);
+  });
+});
+
+test('permission changes in Upstash apply to people who are already signed in', async () => {
+  await inGoogleMode(async () => {
+    setEmployee('a@zopper.com', 'admin');
+    const { cookie } = await signIn('a@zopper.com');
+    const comment = () => call(`/api/items/${ITEM_C}/respond`, { method: 'POST', body: { comment: 'x' }, cookie });
+    assert.equal((await comment()).status, 200);
+    assert.equal((await call(`/api/items/${ITEM_P}/archive`, { method: 'PATCH', body: { archived: true }, cookie })).status, 200);
+
+    setEmployee('a@zopper.com', 'viewer'); // demoted
+    assert.equal((await comment()).status, 403);
+    assert.equal((await call(`/api/items/${ITEM_P}/archive`, { method: 'PATCH', body: { archived: false }, cookie })).status, 403);
+    assert.equal((await call('/api/items?category=partnership', { cookie })).status, 200);
+    assert.equal((await call('/api/session', { cookie })).data.access, 'viewer');
+
+    setEmployee('a@zopper.com', 'editor', { active: false }); // deactivated
+    assert.equal((await call('/api/items?category=partnership', { cookie })).status, 403);
+    assert.deepEqual((await call('/api/session', { cookie })).data, { role: 'denied', authMode: 'google', email: 'a@zopper.com' });
+
+    employees.delete('a@zopper.com'); // removed
+    clearAccessCache();
+    assert.equal((await call('/api/items?category=partnership', { cookie })).status, 403);
+
+    setEmployee('a@zopper.com', 'admin'); // restored
+    assert.equal((await comment()).status, 200);
+  });
+});
+
+test('roles: a Viewer cannot get around the screen by calling the API directly', async () => {
+  await inGoogleMode(async () => {
+    setEmployee('v@zopper.com', 'viewer');
+    const { cookie } = await signIn('v@zopper.com');
+    sentEmails.length = 0;
+    const refused = async (path, options) => {
+      const response = await call(path, { ...options, cookie });
+      assert.equal(response.status, 403, path);
+      assert.match(response.data.error, /viewer role/);
+    };
+    await refused(`/api/items/${ITEM_C}/respond`, { method: 'POST', body: { status: 'resolved' } });
+    await refused(`/api/items/${ITEM_C}/respond`, { method: 'POST', body: { comment: 'hi', status: 'resolved' } });
+    await refused(`/api/items/${ITEM_C}/status`, { method: 'PATCH', body: { status: 'resolved' } });
+    await refused(`/api/items/${ITEM_P}`, { method: 'DELETE' });
+    assert.equal(tables.mail_items.find((i) => i.id === ITEM_C).status, 'active');
+    assert.equal(tables.item_comments.length, 0);
+    assert.ok(tables.mail_items.some((i) => i.id === ITEM_P));
+    assert.equal(sentEmails.length, 0);
+  });
+});
+
+test('comments: written as the verified person, shown by name, deletable only by that same email', async () => {
+  await inGoogleMode(async () => {
+    setEmployee('first@zopper.com', 'editor', { name: 'Sam Lee' });
+    setEmployee('second@zopper.com', 'editor', { name: 'Sam Lee' }); // same display name, different person
+    setEmployee('viewer@zopper.com', 'viewer');
+    const first = (await signIn('first@zopper.com')).cookie;
+    const second = (await signIn('second@zopper.com')).cookie;
+    const viewer = (await signIn('viewer@zopper.com')).cookie;
+
+    const added = await call(`/api/items/${ITEM_C}/respond`, { method: 'POST', body: { comment: 'Called the customer' }, cookie: first });
+    assert.equal(added.data.comment.author, 'Sam Lee'); // no email on screen
+    assert.equal(tables.item_comments[0].author, 'Sam Lee <first@zopper.com>'); // but stored against the email
+    assert.equal(tables.item_comments[0].author_role, 'team');
+    assert.equal(added.data.item.latest_comment.author, 'Sam Lee');
+    const id = added.data.comment.id;
+
+    const read = (cookie) => call(`/api/items/${ITEM_C}`, { cookie });
+    assert.equal((await read(first)).data.comments[0].can_delete, true);
+    assert.equal((await read(second)).data.comments[0].can_delete, false);
+    assert.equal((await read(viewer)).data.comments[0].can_delete, false);
+    assert.equal((await read(viewer)).data.comments[0].body, 'Called the customer'); // viewers can read comments
+
+    assert.equal((await call(`/api/items/${ITEM_C}/comments/${id}`, { method: 'DELETE', cookie: second })).status, 403);
+    assert.equal((await call(`/api/items/${ITEM_C}/comments/${id}`, { method: 'DELETE', cookie: viewer })).status, 403);
+    assert.equal(tables.item_comments.length, 1);
+    const removed = await call(`/api/items/${ITEM_C}/comments/${id}`, { method: 'DELETE', cookie: first });
+    assert.equal(removed.status, 200);
+    assert.equal(removed.data.item.latest_comment, null);
+    assert.equal(tables.item_comments.length, 0);
+  });
+});
+
+test('notify in google mode: the email links to the case but grants nothing, and the sender learns if the recipient has no access', async () => {
+  await inGoogleMode(async () => {
+    process.env.RESEND_API_KEY = 'test-key';
+    try {
+      setEmployee('editor@zopper.com', 'editor');
+      setEmployee('boss@zopper.com', 'viewer');
+      const { cookie } = await signIn('editor@zopper.com');
+      sentEmails.length = 0;
+      const linksBefore = tables.magic_links.length;
+
+      const known = await call('/api/escalate', { method: 'POST', cookie, body: { itemId: ITEM_C, email: 'boss@zopper.com', ccEmail: 'editor@zopper.com', note: 'Please look' } });
+      assert.equal(known.status, 200);
+      assert.equal(known.data.emailSent, true);
+      assert.equal(known.data.recipientAccess, 'viewer');
+      assert.equal(known.data.expiresAt, null);
+      assert.equal(tables.magic_links.length, linksBefore, 'no magic link is created');
+      assert.equal(sentEmails.length, 1);
+      const mail = sentEmails[0];
+      const url = `http://app.test/dashboard/complaints?case=${ITEM_C}`;
+      assert.ok(mail.html.includes(url) && mail.text.includes(url));
+      assert.ok(!/token=/.test(mail.html + mail.text), 'the link carries no credential');
+      assert.match(mail.text, /Sign in with your Zopper Google account/);
+      assert.ok(!/Please don't forward/.test(mail.html));
+
+      const unknown = await call('/api/escalate', { method: 'POST', cookie, body: { itemId: ITEM_C2, email: 'outsider@example.com', ccEmail: 'editor@zopper.com' } });
+      assert.equal(unknown.data.recipientAccess, 'none');
+      assert.equal(unknown.data.emailSent, true);
+
+      // opening that link without signing in shows nothing; signing in opens exactly that case
+      assert.equal((await call(`/api/items?category=complaint_enquiry&id=${ITEM_C}`)).status, 401);
+      const case1 = await call(`/api/items?category=complaint_enquiry&id=${ITEM_C}`, { cookie });
+      assert.deepEqual(case1.data.items.map((i) => i.id), [ITEM_C]);
+      // ...even if the case has since moved to the other tab, or been archived
+      assert.deepEqual((await call(`/api/items?category=partnership&id=${ITEM_C}`, { cookie })).data.items.map((i) => i.id), [ITEM_C]);
+      tables.mail_items.find((i) => i.id === ITEM_C).archived_at = '2026-02-01T00:00:00Z';
+      assert.deepEqual((await call(`/api/items?category=complaint_enquiry&id=${ITEM_C}`, { cookie })).data.items.map((i) => i.id), [ITEM_C]);
+      assert.equal((await call('/api/items?category=complaint_enquiry&id=not-a-uuid', { cookie })).status, 400);
+    } finally {
+      delete process.env.RESEND_API_KEY;
+    }
+  });
+});
+
+test('google mode: sign out clears the session, and one mode never accepts the other mode\'s cookie', async () => {
+  await inGoogleMode(async () => {
+    setEmployee('a@zopper.com', 'admin');
+    const { cookie } = await signIn('a@zopper.com');
+    const out = await raw('/api/logout', { method: 'POST', cookie });
+    assert.ok(out.cookies.some((c) => c.startsWith('zs_user=;') && /Max-Age=0/.test(c)));
+    assert.equal((await call('/api/items?category=partnership', { cookie })).status, 200); // the cookie itself is only cleared in the browser
+    // rolling back to the old sign-in: a Google session is not a legacy session
+    delete process.env.AUTH_MODE;
+    assert.equal((await call('/api/session', { cookie })).data.role, 'anon');
+    assert.equal((await call('/api/items?category=partnership', { cookie })).status, 401);
+    process.env.AUTH_MODE = 'google';
+  });
 });

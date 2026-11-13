@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Archive, Inbox, RefreshCw } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import { api } from '../api.js';
 import { SECTIONS, STATUS_LABELS } from '../sections.js';
 import { isStale, lastSyncAt, markSynced } from '../autoSync.js';
@@ -10,10 +11,15 @@ import ResponsePanel from './ResponsePanel.jsx';
 import Sidebar from './Sidebar.jsx';
 import { useMediaQuery } from '../useMediaQuery.js';
 
-export default function Dashboard({ session, sectionKey, onSignOut }) {
+// The legacy shared-password session has no per-role list: it was always allowed everything.
+const EVERYTHING = { view: true, comment: true, status: true, notify: true, sync: true, manage: true };
+
+export default function Dashboard({ session, sectionKey, onSignOut, caseId = null }) {
   const section = SECTIONS[sectionKey];
-  const isAdmin = session.role === 'admin';
+  const isMember = session.role === 'admin' || session.role === 'user'; // signed in, as opposed to holding a legacy link
+  const can = isMember ? (session.can ?? EVERYTHING) : {}; // what this person's role allows (the server enforces it too)
   const singleItem = session.role === 'link' && session.itemId;
+  const focused = isMember && Boolean(caseId); // opened from an email link: show just that case
   const wide = useMediaQuery('(min-width: 900px)'); // wide enough for the sidebar to be a side panel
 
   const [items, setItems] = useState(null);
@@ -45,7 +51,7 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
     const request = ++latestRequest.current;
     setError('');
     try {
-      const data = await api.listItems(section.category, showArchived, searchTerm);
+      const data = await api.listItems(section.category, showArchived, searchTerm, focused ? caseId : '');
       if (request !== latestRequest.current) return; // a newer search has already replaced this one
       setItems(data.items);
       setResultsFor(searchTerm);
@@ -55,7 +61,7 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
       setError(err.message);
       setItems([]);
     }
-  }, [section.category, showArchived, searchTerm]);
+  }, [section.category, showArchived, searchTerm, focused, caseId]);
 
   // Switching tabs always goes back to the active list.
   useEffect(() => {
@@ -82,8 +88,8 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
 
   async function changeStatus(item, status) {
     if (status === item.status) return;
-    // For admins, "notified" always means picking who to notify, so it opens the Notify form.
-    if (isAdmin && status === 'notified') {
+    // For anyone who can notify, "notified" always means picking who to notify, so it opens the Notify form.
+    if (can.notify && status === 'notified') {
       setNotifying(item);
       return;
     }
@@ -168,14 +174,14 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
   // Automatic sync: when the dashboard is opened, and when a tab left open in the background is
   // brought back. Only for the marketing team (shared-link visitors can't sync).
   useEffect(() => {
-    if (!isAdmin) return undefined;
+    if (!can.sync) return undefined;
     const checkForNew = () => {
       if (document.visibilityState === 'visible' && isStale(lastSyncAt())) runSyncRef.current({ quiet: true });
     };
     checkForNew();
     document.addEventListener('visibilitychange', checkForNew);
     return () => document.removeEventListener('visibilitychange', checkForNew);
-  }, [isAdmin]);
+  }, [can.sync]);
 
   const counts = useMemo(() => {
     const result = { all: items?.length ?? 0 };
@@ -191,11 +197,13 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
 
   const pending = resultsFor !== searchTerm; // a newer search is on its way; the list on screen is stale
   // Complaints get a Comments column (the latest comment, with the count) between Status and the actions.
-  const showCommentsColumn = isAdmin && section.category === 'complaint_enquiry';
-  const title = singleItem ? 'Item for your review' : showArchived ? `Archived · ${section.label}` : section.label;
+  const showCommentsColumn = isMember && section.category === 'complaint_enquiry';
+  const title = singleItem || focused ? 'Item for your review' : showArchived ? `Archived · ${section.label}` : section.label;
   const subtitle = singleItem
     ? 'You were sent this item. Use “Your response” to set its status and leave a comment for the team.'
-    : showArchived
+    : focused
+      ? 'Opened from an email link.'
+      : showArchived
       ? 'Archived items are hidden from the active list. Restore one to bring it back.'
       : items && !searchTerm
         ? `${items.length} ${items.length === 1 ? 'item' : 'items'}`
@@ -210,7 +218,7 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
 
   return (
     <div className="shell">
-      <Sidebar session={session} isAdmin={isAdmin} onSignOut={onSignOut} expires={expires}>
+      <Sidebar session={session} isAdmin={isMember} onSignOut={onSignOut} expires={expires}>
         {wide ? responsePanel : null}
       </Sidebar>
 
@@ -220,14 +228,19 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
             <h1>{title}</h1>
             {subtitle && <p className="muted main-sub">{subtitle}</p>}
           </div>
-          {isAdmin && (
+          {focused && (
+            <Link className="btn btn--glass btn--sm" to={`/dashboard/${sectionKey}`}>
+              Show all {section.tabLabel.toLowerCase()}
+            </Link>
+          )}
+          {can.sync && (
             <button className="btn btn--glass btn--sm" onClick={() => runSync()} disabled={syncing} title="Pull new website form submissions">
               <RefreshCw size={15} className={syncing ? 'spin' : ''} aria-hidden="true" /> {syncing ? 'Syncing…' : 'Sync'}
             </button>
           )}
         </header>
 
-        {!singleItem && (
+        {!singleItem && !focused && (
           <div className="tabs-row">
             <div className="status-tabs" role="group" aria-label="Filter by status">
               {showArchived ? (
@@ -249,7 +262,7 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
                 ))
               )}
             </div>
-            {isAdmin && (
+            {isMember && (
               <button className="views-link" onClick={() => setShowArchived((value) => !value)} aria-pressed={showArchived}>
                 <Archive size={15} aria-hidden="true" />
                 {showArchived ? 'Back to active' : 'Archived'}
@@ -259,7 +272,7 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
           </div>
         )}
 
-        {!singleItem && (
+        {!singleItem && !focused && (
           <div className="toolbar">
             <SearchBox
               value={query}
@@ -333,25 +346,29 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
             </div>
           ) : (
             <div className={`dt-body${pending ? ' dt-body--pending' : ''}`} role="rowgroup" aria-busy={pending}>
-              {visible.map((item, index) => (
-                <ItemRow
-                  key={item.id}
-                  index={index + 1}
-                  item={item}
-                  statuses={section.statuses}
-                  canNotify={isAdmin && !showArchived}
-                  onStatusChange={changeStatus}
-                  onNotify={setNotifying}
-                  onDelete={isAdmin && section.category === 'partnership' ? deleteItem : undefined}
-                  onMove={isAdmin && !showArchived ? moveItem : undefined}
-                  onArchive={isAdmin ? archiveItem : undefined}
-                  archived={showArchived}
-                  readOnlyStatus={Boolean(singleItem)}
-                  showComments={showCommentsColumn}
-                  onItemChanged={(updated) => patchItem(updated.id, updated)}
-                  onCommentSaved={isAdmin ? (updated) => patchItem(updated.id, updated) : undefined}
-                />
-              ))}
+              {visible.map((item, index) => {
+                const isArchived = showArchived || Boolean(item.archived_at); // a case opened from an email may be archived
+                return (
+                  <ItemRow
+                    key={item.id}
+                    index={index + 1}
+                    item={item}
+                    statuses={section.statuses}
+                    canNotify={Boolean(can.notify) && !isArchived}
+                    onStatusChange={changeStatus}
+                    onNotify={setNotifying}
+                    onDelete={can.manage && item.category === 'partnership' ? deleteItem : undefined}
+                    onMove={can.manage && !isArchived ? moveItem : undefined}
+                    onArchive={can.manage ? archiveItem : undefined}
+                    archived={isArchived}
+                    readOnlyStatus={Boolean(singleItem) || (isMember && !can.status)}
+                    showComments={showCommentsColumn}
+                    startOpen={focused}
+                    onItemChanged={(updated) => patchItem(updated.id, updated)}
+                    onCommentSaved={can.comment ? (updated) => patchItem(updated.id, updated) : undefined}
+                  />
+                );
+              })}
             </div>
           )}
         </div>
@@ -363,6 +380,8 @@ export default function Dashboard({ session, sectionKey, onSignOut }) {
         <NotifyModal
           item={notifying}
           adminName={session.name}
+          defaultCc={session.email}
+          signIn={session.authMode === 'google'}
           onClose={() => setNotifying(null)}
           onNotified={(updated) => patchItem(updated.id, updated)}
         />

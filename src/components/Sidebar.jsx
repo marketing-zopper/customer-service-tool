@@ -4,6 +4,8 @@ import { SECTIONS } from '../sections.js';
 
 const NAV_ICONS = { partnership: Handshake, complaints: MessageSquareWarning };
 
+const ROLE_NAMES = { viewer: 'Viewer', editor: 'Editor', admin: 'Admin' };
+
 const initialsOf = (name) =>
   name
     .split(/\s+/)
@@ -49,7 +51,7 @@ export default function Sidebar({ session, isAdmin, onSignOut, expires, children
         </span>
         <span className="sidebar-user-text">
           <strong>{isAdmin ? session.name : 'Shared link'}</strong>
-          <small>{isAdmin ? 'Marketing team' : expires ? `Valid until ${expires}` : 'Limited access'}</small>
+          <small>{isAdmin ? ROLE_NAMES[session.access] || 'Marketing team' : expires ? `Valid until ${expires}` : 'Limited access'}</small>
         </span>
         {isAdmin && (
           <button className="sidebar-signout" onClick={onSignOut} aria-label="Sign out" title="Sign out">

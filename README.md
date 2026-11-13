@@ -1,6 +1,6 @@
 # Zopper Service Triage
 
-Internal dashboard that pulls the website's contact-form submissions from Webflow (read-only), sorts them into **Partnership** or **Complaints / Enquiries**, and lets the marketing team notify the concerned person about any item by email, with the full details and a one-item magic link. There are no user accounts. Access is either the shared marketing password or a magic link.
+Internal dashboard that pulls the website's contact-form submissions from Webflow (read-only), sorts them into **Partnership** or **Complaints / Enquiries**, and lets the marketing team notify the concerned person about any item by email, with the full details and a one-item magic link. Access is either **Google sign-in checked against the central Zopper employee roles** (`AUTH_MODE=google`) or, until that is switched on, the original shared marketing password and magic links (`AUTH_MODE=legacy`, the default). See "Google sign-in and roles" below.
 
 - **Frontend:** React (JS) + Vite SPA, Poppins, lucide-react. CRM-style layout: a dark brand-blue translucent sidebar, a frosted-glass main panel with underlined status tabs and a search toolbar, and a data table (#, Sender, Query, Received, Status, Actions, plus Comments on the Complaints tab). The same table is kept on laptop and display-scaled Windows screens (down to 1200px wide, just tighter); only below that does each row become a compact card, and on phones the sidebar becomes a top bar.
 - **Backend:** one Node router (`server/router.js`) served as a Vercel function (`api/index.js`) in production and by `server/dev.js` locally
@@ -25,8 +25,11 @@ Minimum to see the dashboard: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `ADMI
 | Variable | Needed for | If missing |
 |---|---|---|
 | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | everything | API returns 500 |
-| `ADMIN_PASSWORD` | the shared marketing password | login fails with 500 |
-| `SESSION_SECRET` | signing the admin cookie (32+ chars) | login fails with 500 |
+| `AUTH_MODE` | `legacy` (default) or `google` | legacy |
+| `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | the employee check when `AUTH_MODE=google` | everyone is refused (503) |
+| `ACCESS_CACHE_SECONDS`, `SESSION_DAYS` | how long a role is remembered / a Google sign-in lasts | 10 / 7 |
+| `ADMIN_PASSWORD` | the shared marketing password (legacy mode) | login fails with 500 |
+| `SESSION_SECRET` | signing the session cookies (32+ chars). This app's own; never reuse another app's | sign-in fails with 500 |
 | `APP_URL` | magic links and the logo in emails | defaults to `http://localhost:5173` |
 | `MAGIC_LINK_TTL_DAYS` | link expiry | 7 |
 | `RESEND_API_KEY`, `MAIL_FROM` | sending notification emails | the modal shows the link so it can be shared by hand |
@@ -52,7 +55,38 @@ Every Webflow submission is recorded by id in `ingested_messages` the first time
 
 Import the repo, set the env vars above, deploy. `vercel.json` rewrites every non-`/api` path to the SPA and sends every `/api/...` request to the one API function. There is no cron job: entries are pulled when someone opens the dashboard, and whenever someone presses **Sync**, so nothing is imported while nobody is looking (the next visit catches up).
 
-## How access works
+## Google sign-in and roles
+
+Set `AUTH_MODE=google` and employees sign in with their Zopper Google account. Nothing about the Master App is touched; Service Triage only **reads** its employee records.
+
+**How a person gets in** (the same whether they came from the Marketing Studio dashboard or typed the Service Triage address):
+
+1. No Service Triage session → the browser is redirected to Google through this project's Supabase Auth. If they are already signed in to Google, Google returns immediately and they see nothing but a brief redirect.
+2. `/api/auth/callback` exchanges the one-time code (PKCE, server-side), asks Supabase Auth who the token belongs to, and takes the email **Google verified**.
+3. It looks that email up in the central Upstash hash `zms:employees` (`HGET`, the only command this app can send). Access needs a record that is `active`, whose `roles["service-triage"]` is `viewer`, `editor` or `admin`, and whose `permissions["service-triage"]` is not `false`. Anything else (no record, inactive, missing/unknown role, unreadable record) is **No Access**: no session is created. If Upstash can't be reached, access is refused (never granted on a guess).
+4. A signed, httpOnly cookie (`zs_user`, 7 days) remembers who signed in. **Their role is looked up again on every request** (remembered for ~10 seconds), so a demotion, deactivation or removal in the Admin Portal takes effect almost immediately, and the API enforces it, not just the screen.
+
+`marketingext@zopper.com` is the **Global Super Admin**: full access, needs no Upstash record, and is not an assignable role.
+
+| Role | Can |
+|---|---|
+| No Access | nothing |
+| Viewer | view and search cases and comments, including the archive (read-only: can't archive or restore) |
+| Editor | Viewer + add comments, change statuses, delete own comments, send notifications, trigger Webflow sync |
+| Admin | Editor + move cases, archive / restore, permanently delete cases |
+
+The permission table is `ACTIONS` in `server/lib/auth.js`; each API route names the action it needs.
+
+**Email links** (Notify) now point to `/dashboard/<section>?case=<id>` and carry **no credential**. Opening one signs the reader in with Google and shows just that case. Whoever is notified must therefore be a Zopper employee with a Service Triage role; the Notify form tells the sender when the recipient has none. Comments are stored against the verified email (shown by name), so "delete your own comment" can't be claimed by someone with the same name.
+
+**Setting it up**
+
+1. In Google Cloud, add this one **Authorized redirect URI** to the OAuth client: `<SUPABASE_URL>/auth/v1/callback`.
+2. Turn the Google provider on in this project's Supabase Auth, with that client id and secret, and allow-list the return addresses `<APP_URL>/api/auth/callback` and `http://localhost:5173/api/auth/callback`. `node supabase/configure-auth.mjs` shows the current setup and `--apply` does it (it reads everything from environment variables; see the file header).
+3. In Vercel set `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` (ideally a read-only token), then `AUTH_MODE=google` and redeploy.
+4. **Rollback:** set `AUTH_MODE=legacy` and redeploy. The legacy password, magic links and their database table are untouched; Google sessions are not accepted in legacy mode and vice versa. Once Google sign-in is proven, the legacy code (`legacy` branches in `server/lib/auth.js`, `router.js`, `Gate.jsx`) can be deleted.
+
+## How access works (legacy mode, `AUTH_MODE=legacy`)
 
 - **Marketing team (5 people):** pick a name, enter the shared password. The server checks the name against `admin_names` and the password against `ADMIN_PASSWORD` (constant-time), then sets a signed, httpOnly, 30-day cookie carrying the name. That name is stored as `created_by` on any link they generate. Sessions can't be revoked individually, so rotate `SESSION_SECRET` to sign everyone out.
 - **Magic link:** `/dashboard/<section>?token=…`. The token is 256 bits of randomness. Only its SHA-256 is stored. The page sends it in an `x-magic-token` header so it stays out of API logs. The backend checks it on every request: the link only works for its category, and an item-scoped link only for that one item. Link holders can change status but can't notify, move, archive or delete. An expired or unknown link shows the branded "access restricted" screen.
