@@ -412,7 +412,7 @@ const handlers = {
     let emailError = null;
     if (emailConfigured()) {
       try {
-        await sendNotificationEmail({ to: recipient, cc: ccList, item, url, notifiedBy: auth.name, note: cleanNote, expiresAt, signIn: authMode() === 'google' });
+        await sendNotificationEmail({ to: recipient, cc: ccList, item, url, notifiedBy: auth.name, note: cleanNote, expiresAt, signIn: authMode() === 'google', requestAccess: recipientAccess === 'none' });
         emailSent = true;
       } catch (error) {
         console.error('[notify] email failed:', error.message);

@@ -158,7 +158,7 @@ export default function NotifyModal({ item, adminName, defaultCc = '', signIn = 
             <h2 id="notify-title">{result.emailSent ? 'Notified' : 'Marked notified, but email not sent'}</h2>
             {result.recipientAccess === 'none' && (
               <p className="form-error" role="alert">
-                {email} has no Service Triage access yet, so they can't open the case. Ask an admin to assign them a role, or use the email's reply address to reach them.
+                {email} has no Service Triage access yet, so they can't open the case. Their email has a "Request Access" button that asks an admin for a role.
               </p>
             )}
             {result.emailSent ? (

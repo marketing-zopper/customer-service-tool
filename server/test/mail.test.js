@@ -43,12 +43,9 @@ test('the email shows every detail, the time in IST, and the whole message', () 
     assert.ok(part.includes('9999900000'));
     assert.ok(part.includes('Acme'));
     assert.ok(part.includes('Founder'));
-    assert.ok(part.includes('Lead Generation (Contact Page)'));
     assert.ok(part.includes('We want to partner.'));
     assert.ok(part.includes('17 Oct 2026')); // 05:07 UTC on the 17th is 10:37 IST the same day
     assert.ok(part.includes('10:37') && part.includes('IST'));
-    assert.ok(part.includes('Arpit Jain'));
-    assert.ok(part.includes('arpit@zopper.com'));
     assert.ok(part.includes('https://app.test/dashboard/partnership?token=abc'));
   }
   // the preview field is not what gets shown
@@ -63,7 +60,7 @@ test('a very long message is included in full', () => {
 test('missing pieces are simply left out, not shown as "undefined"', () => {
   const { html, text } = render(item({ sender_name: null, body_full: 'Plain message only' }));
   assert.ok(!html.includes('undefined') && !text.includes('undefined') && !html.includes('null'));
-  assert.ok(text.includes('From: asha@acme.com'));
+  assert.ok(text.includes('Name: asha@acme.com'));
   assert.ok(!text.includes('Phone:') && !text.includes('Organisation:'));
   assert.ok(text.includes('Plain message only'));
   // an empty message falls back to the preview text rather than an empty box
@@ -77,9 +74,49 @@ test('everything user-supplied is HTML-escaped', () => {
   assert.ok(html.includes('&lt;b&gt;bold&lt;/b&gt; &amp; &quot;quotes&quot;'));
 });
 
-test('the sender is named in the intro and a note is shown when given', () => {
-  assert.match(render().text, /Arpit Jain \(arpit@zopper\.com\) from the marketing team has notified you about this partnership/);
+test('a note is shown only when given, and there is no "has notified you" intro', () => {
+  for (const part of [render().html, render().text]) assert.ok(!/has notified you/.test(part));
   assert.ok(!render().text.includes('Note from'));
   assert.ok(render(item(), { note: 'Please call today' }).text.includes('Note from Arpit Jain: Please call today'));
-  assert.match(render().text, /Reply to this email to reach Arpit Jain/);
+  assert.match(render().text, /Reply to this email to reach Arpit Jain/); // magic-link wording is unchanged
+});
+
+test('the details list is labelled Name, drops "Submitted via", and holds the message as its last row', () => {
+  const { html, text } = render();
+  assert.ok(text.includes('Name: Asha Rao <asha@acme.com>'));
+  assert.ok(!/\bFrom:/.test(text) && !html.includes('>From<'));
+  assert.ok(!html.includes('Submitted via') && !text.includes('Submitted via') && !html.includes('Lead Generation'));
+  assert.ok(html.includes('>Message</td>'), 'Message is a row of the list, not a separate box');
+  assert.ok(!html.includes('border-left:3px solid #19B4EA'));
+  assert.ok(text.indexOf('Received:') < text.indexOf('Message: Hello,'));
+});
+
+test('the header just says Zopper, centred', () => {
+  const { html } = render();
+  assert.match(html, /text-align:center;">\s*<img[^>]*alt="Zopper"[\s\S]*?>Zopper<\/span>/);
+  assert.ok(!html.includes('Zopper Service Triage'));
+});
+
+test('Google-mode footer invites a reply or the dashboard link', () => {
+  const { html, text } = render(item(), { signIn: true });
+  const line = 'You can reply to the same mail to start conversation or review the item on dashboard via the provided link above!';
+  assert.ok(html.includes(line) && text.includes(line));
+  assert.ok(!html.includes('This link only takes you'));
+});
+
+test('Request Access sits beside Review only when the recipient has no access', () => {
+  const none = render(item(), { signIn: true, recipient: 'out@example.com', requestAccess: true });
+  assert.ok(none.html.includes('Review this item') && none.html.includes('Request Access'));
+  assert.ok(none.html.indexOf('Review this item') < none.html.indexOf('Request Access'));
+  const href = none.html.match(/href="(mailto:[^"]+)"/)[1].replace(/&amp;/g, '&').replace(/&#39;/g, "'");
+  const url = new URL(href);
+  assert.equal(decodeURIComponent(url.pathname), 'marketingext@zopper.com');
+  assert.equal(url.searchParams.get('subject'), 'Request for Service Triage access');
+  assert.equal(url.searchParams.get('cc'), 'arpit@zopper.com');
+  assert.ok(url.searchParams.get('body').includes('out@example.com'));
+  assert.ok(none.text.includes('Request access: mailto:'));
+  for (const extra of [{ signIn: true }, { signIn: true, requestAccess: false }, {}]) {
+    const mail = render(item(), extra);
+    assert.ok(!mail.html.includes('Request Access') && !mail.html.includes('mailto:') && !mail.text.includes('Request access'));
+  }
 });

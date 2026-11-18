@@ -395,7 +395,6 @@ test('notify sends the full details to the recipient, copies and sets reply-to t
     assert.deepEqual(many.data.ccEmails, ['me@zopper.com', 'lead@zopper.com', 'boss@zopper.com']);
     assert.deepEqual(sentEmails[0].cc, ['me@zopper.com', 'lead@zopper.com']);
     assert.deepEqual(sentEmails[0].reply_to, ['me@zopper.com', 'lead@zopper.com', 'boss@zopper.com']);
-    assert.ok(sentEmails[0].text.includes('Also copied: lead@zopper.com, boss@zopper.com.'));
     assert.equal(tables.magic_links.at(-1).created_by, 'Arpit Jain <me@zopper.com, lead@zopper.com, boss@zopper.com>');
     // an array works too
     sentEmails.length = 0;
@@ -1047,12 +1046,14 @@ test('notify in google mode: the email links to the case but grants nothing, and
       const url = `http://app.test/dashboard/complaints?case=${ITEM_C}`;
       assert.ok(mail.html.includes(url) && mail.text.includes(url));
       assert.ok(!/token=/.test(mail.html + mail.text), 'the link carries no credential');
-      assert.match(mail.text, /Sign in with your Zopper Google account/);
+      assert.match(mail.text, /review the item on dashboard via the provided link above/);
       assert.ok(!/Please don't forward/.test(mail.html));
+      assert.ok(!mail.html.includes('Request Access'), 'someone who already has a role is not offered "Request Access"');
 
       const unknown = await call('/api/escalate', { method: 'POST', cookie, body: { itemId: ITEM_C2, email: 'outsider@example.com', ccEmail: 'editor@zopper.com' } });
       assert.equal(unknown.data.recipientAccess, 'none');
       assert.equal(unknown.data.emailSent, true);
+      assert.ok(sentEmails.at(-1).html.includes('Request Access'), 'someone with no role is offered "Request Access"');
 
       // opening that link without signing in shows nothing; signing in opens exactly that case
       assert.equal((await call(`/api/items?category=complaint_enquiry&id=${ITEM_C}`)).status, 401);
